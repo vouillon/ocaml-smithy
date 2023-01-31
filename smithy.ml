@@ -1,15 +1,10 @@
 (*
 - mli files
 
-- converter enum to string (more generally, serializer / deserializer)
+- serializer / deserializer      Json / XML
   ==> mark inputs and ouputs
 
-let rec toto toto' : Yojson.Safe.t =
-  let {kls = kls'; jffs} : foo = toto' in
-  `Assoc ["kls", kls kls'; ...]
-and ...
-`String (Base64.encode_string s)
-
+- float: +/-infinity
 
 - deal especially with operation requests (does not define a type) and
   errors (define a union)
@@ -44,6 +39,12 @@ module IdMap = Map.Make (struct
   let compare = compare
 end)
 
+module IdSet = Set.Make (struct
+  type t = shape_id
+
+  let compare = compare
+end)
+
 type traits = (string * Yojson.Safe.t) list
 
 type shape =
@@ -63,7 +64,7 @@ type shape =
   | Union of (string * shape_id * traits) list
   | Service
   | Resource
-  | Operation
+  | Operation of { input : shape_id; output : shape_id }
 
 let parse_shape (id, sh) =
   let typ = Util.(sh |> member "type" |> to_string) in
@@ -120,7 +121,9 @@ let parse_shape (id, sh) =
       | "union" -> Union (parse_members ())
       | "service" -> Service
       | "resource" -> Resource
-      | "operation" -> Operation
+      | "operation" ->
+          Operation
+            { input = parse_member "input"; output = parse_member "output" }
       | _ -> assert false),
       traits ) )
 
@@ -145,36 +148,37 @@ let to_snake_case =
     Re.(
       compile (seq [ group (alt [ lowercase; rg '0' '9' ]); group uppercase ]))
   in
+  let space_re = Re.(compile (set " -")) in
   let replace re s =
     Re.replace re ~f:(fun g -> Re.Group.get g 1 ^ "_" ^ Re.Group.get g 2) s
   in
   fun s ->
     s |> replace first_pattern_re |> replace second_pattern_re
+    |> Re.replace space_re ~f:(fun _ -> "_")
     |> String.lowercase_ascii
 
 let reserved_words =
   [
-    "option";
-    "end";
     "and";
-    "type";
-    "object";
-    "string";
-    "then";
-    "else";
-    "or";
-    "method";
-    "constraint";
-    "float";
-    "match";
-    "function";
-    "bool";
-    "to";
-    "mutable";
-    "include";
     "begin";
+    "constraint";
+    "else";
+    "end";
     "external";
-    "None";
+    "function";
+    "include";
+    "match";
+    "method";
+    "mutable";
+    "object";
+    "or";
+    "then";
+    "to";
+    "type";
+    "bool";
+    "float";
+    "option";
+    "string";
   ]
 
 let uncapitalized_identifier s =
@@ -185,11 +189,8 @@ let all_upper_re =
   Re.(compile (whole_string (rep (alt [ rg 'A' 'Z'; rg '0' '9'; char '_' ]))))
 
 let capitalized_identifier s =
-  let s =
-    if Re.execp all_upper_re s then s
-    else String.capitalize_ascii (to_snake_case s)
-  in
-  if List.mem s reserved_words then s ^ "_" else s
+  if Re.execp all_upper_re s then s
+  else String.capitalize_ascii (to_snake_case s)
 
 let type_name id =
   match id.namespace with
@@ -225,222 +226,319 @@ let type_of_shape shapes nm =
     | None -> assert false
     | Some (typ, _) -> typ
 
-let print_constructor f shapes name fields =
-  Format.fprintf f "@[<2>let @[<2>%s" (type_name name);
+open Ast_helper
+
+let loc = Location.none
+
+let default_value shapes typ default =
+  match default with
+  | `String s -> Exp.constant (Const.string s)
+  | `Int n ->
+      Exp.constant
+        (match type_of_shape shapes typ with
+        | Float | Double -> Const.float (Printf.sprintf "%d." n)
+        | Integer -> Const.int32 (Int32.of_int n)
+        | Long -> Const.int64 (Int64.of_int n)
+        | _ -> assert false)
+  | `Bool b -> if b then [%expr true] else [%expr false]
+  | _ -> assert false
+
+let type_ident id =
+  Typ.constr (Location.mknoloc (Longident.Lident (type_name id))) []
+
+let print_constructor shapes name fields =
   let has_optionals =
-    List.fold_left
-      (fun opt field ->
+    List.exists
+      (fun (_, _, traits) ->
+        List.mem_assoc "smithy.api#default" traits
+        || not (List.mem_assoc "smithy.api#required" traits))
+      fields
+  in
+  let body =
+    Exp.constraint_
+      (Exp.record
+         (List.map
+            (fun (nm, _, _) ->
+              let label = Location.mknoloc (Longident.Lident (field_name nm)) in
+              (label, Exp.ident label))
+            fields)
+         None)
+      (type_ident name)
+  in
+  let expr =
+    List.fold_right
+      (fun field (expr : Parsetree.expression) ->
         let nm, typ, traits' = field in
-        let optional = optional_member field in
         match List.assoc_opt "smithy.api#default" traits' with
         | Some default when default <> `Null ->
-            Format.fprintf f "@ ?(%s = %a)" (field_name nm)
-              (fun f default ->
-                match default with
-                | `String s -> Format.fprintf f "\"%s\"" s
-                | `Int n -> (
-                    match type_of_shape shapes typ with
-                    | Float | Double -> Format.fprintf f "%d." n
-                    | Integer -> Format.fprintf f "%dl" n
-                    | Long -> Format.fprintf f "%dL" n
-                    | _ -> assert false)
-                | `Bool b ->
-                    Format.fprintf f "%s" (if b then "true" else "false")
-                | _ -> Format.eprintf "%s@." (Yojson.Safe.to_string default))
-              default;
-            true
+            Exp.fun_
+              (Optional (field_name nm))
+              (Some (default_value shapes typ default))
+              (Pat.var (Location.mknoloc (field_name nm)))
+              expr
         | _ ->
-            Format.fprintf f "@ %s%s"
-              (if optional then "?" else "~")
-              (field_name nm);
-            opt || optional)
-      false fields
+            let optional = optional_member field in
+            Exp.fun_
+              (if optional then Optional (field_name nm)
+              else Labelled (field_name nm))
+              None
+              (Pat.var (Location.mknoloc (field_name nm)))
+              expr)
+      fields
+      (if has_optionals then Exp.fun_ Nolabel None [%pat? ()] body else body)
   in
-  if has_optionals then Format.fprintf f "@ ()";
-  Format.fprintf f "@]@ : %s =@ @[<hv>{" (type_name name);
-  Format.pp_print_list
-    ~pp_sep:(fun f () -> Format.fprintf f "@ ;")
-    (fun f (nm, _, _) -> Format.fprintf f " %s" (field_name nm))
-    f fields;
-  Format.fprintf f " }@]@]@."
+  [%stri let [%p Pat.var (Location.mknoloc (type_name name))] = [%e expr]]
 
-let print_constructors f shapes =
-  IdMap.iter
-    (fun name (sh, _) ->
+let print_constructors shapes =
+  IdMap.fold
+    (fun name (sh, _) rem ->
       match sh with
-      | Structure l when l <> [] -> print_constructor f shapes name l
-      | _ -> ())
-    shapes
+      | Structure l when l <> [] -> print_constructor shapes name l :: rem
+      | _ -> rem)
+    shapes []
 
-let print_type f (nm, (sh, traits)) =
-  Format.fprintf f " %s =@ " (type_name nm);
-  (match sh with
-  | Blob -> Format.fprintf f "string"
-  | Boolean -> Format.fprintf f "bool"
-  | String -> Format.fprintf f "string"
+let type_constructor ?arg_type nm =
+  Type.constructor
+    ?args:
+      (Option.map
+         (fun typ -> Parsetree.Pcstr_tuple [ type_ident typ ])
+         arg_type)
+    (Location.mknoloc (constr_name nm))
+
+let print_type (nm, (sh, traits)) =
+  let manifest_type manifest =
+    Type.mk ~manifest (Location.mknoloc (type_name nm))
+  in
+  match sh with
+  | Blob -> manifest_type [%type: string]
+  | Boolean -> manifest_type [%type: bool]
+  | String -> manifest_type [%type: string]
   | Enum l ->
-      Format.pp_print_list
-        ~pp_sep:(fun f () -> Format.fprintf f "@ ")
-        (fun f (nm, _, _) -> Format.fprintf f "| %s" (constr_name nm))
-        f l
-  | Integer -> Format.fprintf f "Int32.t"
-  | Long -> Format.fprintf f "Int64.t"
-  | Float -> Format.fprintf f "float"
-  | Double -> Format.fprintf f "float"
-  | Timestamp -> Format.fprintf f "CalendarLib.Calendar.t"
-  | Document -> Format.fprintf f "Yojson.Safe.t"
+      let l = List.map (fun (nm, _, _) -> type_constructor nm) l in
+      Type.mk ~kind:(Ptype_variant l) (Location.mknoloc (type_name nm))
+  | Integer -> manifest_type [%type: Int32.t]
+  | Long -> manifest_type [%type: Int64.t]
+  | Float | Double -> manifest_type [%type: float]
+  | Timestamp -> manifest_type [%type: CalendarLib.Calendar.t]
+  | Document -> manifest_type [%type: Yojson.Safe.t]
   | List id ->
       let sparse = List.mem_assoc "smithy.api#sparse" traits in
-      Format.fprintf f "%s %slist" (type_name id)
-        (if sparse then "option " else "")
-  | Map (key, value) ->
+      let id = type_ident id in
+      manifest_type
+        [%type: [%t if sparse then [%type: [%t id] option] else id] list]
+  | Map (_key, value) ->
       let sparse = List.mem_assoc "smithy.api#sparse" traits in
-      Format.fprintf f "(*%s ->*) %s %sStringMap.t" (type_name key)
-        (type_name value)
-        (if sparse then "option " else "")
-  | Structure [] -> Format.fprintf f "unit"
+      let id = type_ident value in
+      manifest_type
+        [%type: [%t if sparse then [%type: [%t id] option] else id] StringMap.t]
+  | Structure [] -> manifest_type [%type: unit]
   | Structure l ->
-      Format.fprintf f "@[<hv>{";
-      Format.pp_print_list
-        ~pp_sep:(fun f () -> Format.fprintf f "@ ;")
-        (fun f ((nm, typ, _) as field) ->
-          let optional = optional_member field in
-          Format.fprintf f " %s : %s%s" (field_name nm) (type_name typ)
-            (if optional then " option" else ""))
-        f l;
-      Format.fprintf f " }@]"
+      let l =
+        List.map
+          (fun ((nm, typ, _) as field) ->
+            let optional = optional_member field in
+            let id = type_ident typ in
+            Type.field
+              (Location.mknoloc (field_name nm))
+              (if optional then [%type: [%t id] option] else id))
+          l
+      in
+      Type.mk ~kind:(Ptype_record l) (Location.mknoloc (type_name nm))
   | Union l ->
-      Format.pp_print_list
-        ~pp_sep:(fun f () -> Format.fprintf f "@ ")
-        (fun f (nm, typ, _) ->
-          assert (typ <> { namespace = "smithy.api"; identifier = "Unit" });
-          Format.fprintf f "| %s of %s" (constr_name nm) (type_name typ))
-        f l
-  | Service | Resource | Operation -> assert false);
-  Format.fprintf f "@]@."
+      let l =
+        List.map
+          (fun (nm, typ, _) ->
+            assert (typ <> { namespace = "smithy.api"; identifier = "Unit" });
+            type_constructor ~arg_type:typ nm)
+          l
+      in
+      Type.mk ~kind:(Ptype_variant l) (Location.mknoloc (type_name nm))
+  | Service | Resource | Operation _ -> assert false
 
-let print_types f shs =
-  Format.fprintf f "@[<hv2>type";
-  Format.pp_print_list
-    ~pp_sep:(fun f () -> Format.fprintf f "@[<hv2>and")
-    print_type f
-    (IdMap.bindings
-       (IdMap.filter
-          (fun _ (typ, _) ->
-            match typ with Service | Operation | Resource -> false | _ -> true)
-          shs))
+let print_types shs =
+  Str.type_ Recursive
+    (List.map print_type
+       (IdMap.bindings
+          (IdMap.filter
+             (fun _ (typ, _) ->
+               match typ with
+               | Service | Operation _ | Resource -> false
+               | _ -> true)
+             shs)))
 
-let converter ~sparse f id =
-  let convert =
+let ident id = Exp.ident (Location.mknoloc (Longident.Lident id))
+
+let converter ~sparse id =
+  let convert id =
     match id.namespace with
     | "smithy.api" -> (
         match id.identifier with
-        | "Boolean" | "PrimitiveBoolean" -> "(fun x -> `Bool x)"
-        | "Blob" | "String" -> "(fun x -> `String x)"
-        | "Integer" -> "(fun x -> `Intlit (Int32.to_string x))"
-        | "Long" | "PrimitiveLong" -> "(fun x -> `Intlit (Int64.to_string x))"
-        | "Float" | "Double" -> "(fun x -> `Float x)"
-        | "Timestamp" ->
-            "(fun x -> `Float (CalendarLib.Calendar.to_unixfloat x))"
-        | "Document" -> "(fun x -> x)"
+        | "Boolean" | "PrimitiveBoolean" -> [%expr Converters.To_JSON.boolean]
+        | "Blob" -> [%expr Converters.To_JSON.blob]
+        | "String" -> [%expr Converters.To_JSON.string]
+        | "Integer" -> [%expr Converters.To_JSON.integer]
+        | "Long" | "PrimitiveLong" -> [%expr Converters.To_JSON.long]
+        | "Float" | "Double" -> [%expr Converters.To_JSON.float]
+        | "Timestamp" -> [%expr Converters.To_JSON.timestamp]
+        | "Document" -> [%expr Converters.To_JSON.document]
         | _ -> assert false)
-    | _ -> type_name id
+    | _ -> ident (type_name id)
   in
-  Format.fprintf f "%s"
-    (if sparse then
-     "(fun x -> match x with | None -> `Null | Some x -> " ^ convert ^ " x)"
-    else convert)
+  if sparse then [%expr Converters.To_JSON.option [%e convert id]]
+  else convert id
 
-let to_json f (name, (sh, traits)) =
+let member_name ?(name = "smithy.api#jsonName") (nm, _, traits) =
+  try Yojson.Safe.Util.to_string (List.assoc name traits) with Not_found -> nm
+
+let pat_construct nm =
+  Pat.construct (Location.mknoloc (Longident.Lident (constr_name nm)))
+
+let to_json (name, (sh, traits)) =
   let nm = type_name name ^ "'" in
-  Format.fprintf f " %s (%s : %s) : Yojson.Safe.t =@ " (type_name name) nm
-    (type_name name);
-  match sh with
-  | Blob -> Format.fprintf f "`String (Base64.encode_string %s)" nm
-  | Boolean -> Format.fprintf f "`Bool %s" nm
-  | String -> Format.fprintf f "`String %s" nm
-  | Enum l ->
-      Format.fprintf f "`String @[<hv1>(match %s with@ %a)@]" nm
-        (Format.pp_print_list
-           ~pp_sep:(fun f () -> Format.fprintf f "@ ")
-           (fun f (nm, _, traits) ->
-             Format.fprintf f "| %s -> \"%s\"" (constr_name nm)
-               (try
-                  Yojson.Safe.Util.to_string
-                    (List.assoc "smithy.api#enumValue" traits)
-                with Not_found -> nm)))
-        l
-  | Integer -> Format.fprintf f "`Intlit (Int32.to_string %s)" nm
-  | Long -> Format.fprintf f "`Intlit (Int64.to_string %s)" nm
-  | Float | Double -> Format.fprintf f "`Float %s" nm
-  | Timestamp ->
-      Format.fprintf f "`Float (CalendarLib.Calendar.to_unixfloat %s)" nm
-  | Document -> Format.fprintf f "%s" nm
-  | List id ->
-      let sparse = List.mem_assoc "smithy.api#sparse" traits in
-      Format.fprintf f "`List (List.map %a %s)" (converter ~sparse) id nm
-  | Map (_key, value) ->
-      let sparse = List.mem_assoc "smithy.api#sparse" traits in
-      Format.fprintf f "`Assoc (StringMap.bindings (StringMap.map %a %s))"
-        (converter ~sparse) value nm
-  | Structure [] -> Format.fprintf f "`Assoc []"
-  | Structure l ->
-      Format.fprintf f
-        "@[<hv>match %s with@ | @[<hv>{%a }@] ->@;<1 2>`Assoc @[<hv>[%a ]@]@]"
-        nm
-        (Format.pp_print_list
-           ~pp_sep:(fun f () -> Format.fprintf f "@,;")
-           (fun f (nm, _, _) ->
-             Format.fprintf f " %s = %s" (field_name nm) (field_name nm ^ "'")))
-        l
-        (Format.pp_print_list
-           ~pp_sep:(fun f () -> Format.fprintf f "@,;")
-           (fun f ((nm, typ, _) as field) ->
-             let optional = optional_member field in
-             Format.fprintf f " (\"%s\", %a %s)" nm
-               (converter ~sparse:optional)
-               typ
-               (field_name nm ^ "'")))
-        l
-  | Union l ->
-      Format.fprintf f "`Assoc @[<hv1>[match %s with@ %a]@]" nm
-        (Format.pp_print_list
-           ~pp_sep:(fun f () -> Format.fprintf f "@ ")
-           (fun f (nm, typ, _traits) ->
-             Format.fprintf f "| %s x -> (\"%s\", %a x)" (constr_name nm) nm
-               (converter ~sparse:false) typ))
-        l
-  | Service | Resource | Operation -> assert false
+  Vb.mk
+    (Pat.var (Location.mknoloc (type_name name)))
+    (Exp.fun_ Nolabel None
+       [%pat? ([%p Pat.var (Location.mknoloc nm)] : [%t type_ident name])]
+       (Exp.constraint_
+          (match sh with
+          | Blob -> [%expr Converters.To_JSON.blob [%e ident nm]]
+          | Boolean -> [%expr Converters.To_JSON.boolean [%e ident nm]]
+          | String -> [%expr Converters.To_JSON.string [%e ident nm]]
+          | Enum l ->
+              [%expr
+                Converters.To_JSON.string
+                  [%e
+                    Exp.match_ (ident nm)
+                      (List.map
+                         (fun ((nm, _, _) as enum) ->
+                           Exp.case (pat_construct nm None)
+                             (Exp.constant
+                                (Const.string
+                                   (member_name ~name:"smithy.api#enumValue"
+                                      enum))))
+                         l)]]
+          | Integer -> [%expr Converters.To_JSON.integer [%e ident nm]]
+          | Long -> [%expr Converters.To_JSON.long [%e ident nm]]
+          | Float | Double -> [%expr Converters.To_JSON.float [%e ident nm]]
+          | Timestamp -> [%expr Converters.To_JSON.timestamp [%e ident nm]]
+          | Document -> [%expr Converters.To_JSON.document [%e ident nm]]
+          | List id ->
+              let sparse = List.mem_assoc "smithy.api#sparse" traits in
+              [%expr
+                Converters.To_JSON.list [%e converter ~sparse id] [%e ident nm]]
+          | Map (_key, value) ->
+              let sparse = List.mem_assoc "smithy.api#sparse" traits in
+              [%expr
+                Converters.To_JSON.map [%e converter ~sparse value]
+                  [%e ident nm]]
+          | Structure [] -> [%expr Converters.To_JSON.structure []]
+          | Structure l ->
+              Exp.match_ (ident nm)
+                [
+                  Exp.case
+                    (Pat.record
+                       (List.map
+                          (fun (nm, _, _) ->
+                            ( Location.mknoloc (Longident.Lident (field_name nm)),
+                              Pat.var (Location.mknoloc (field_name nm ^ "'"))
+                            ))
+                          l)
+                       Closed)
+                    [%expr
+                      Converters.To_JSON.structure
+                        [%e
+                          List.fold_right
+                            (fun ((nm, typ, _) as field) lst ->
+                              let optional = optional_member field in
+                              [%expr
+                                ( [%e
+                                    Exp.constant
+                                      (Const.string (member_name field))],
+                                  [%e (converter ~sparse:optional) typ]
+                                    [%e ident (field_name nm ^ "'")] )
+                                :: [%e lst]])
+                            l [%expr []]]];
+                ]
+          | Union l ->
+              [%expr
+                Converters.To_JSON.structure
+                  [
+                    [%e
+                      Exp.match_ (ident nm)
+                        (List.map
+                           (fun ((nm, typ, _) as constr) ->
+                             Exp.case
+                               (pat_construct nm (Some ([], [%pat? x])))
+                               [%expr
+                                 [%e
+                                   Exp.constant
+                                     (Const.string (member_name constr))],
+                                   [%e (converter ~sparse:false) typ] x])
+                           l)];
+                  ]]
+          | Service | Resource | Operation _ -> assert false)
+          [%type: Yojson.Safe.t]))
 
-let print_to_json f shs =
-  Format.fprintf f "@[<hv2>module To_Json = struct@ ";
-  Format.fprintf f "@[<hv2>let rec";
-  Format.pp_print_list
-    ~pp_sep:(fun f () -> Format.fprintf f "@]@ @[<hv2>and")
-    to_json f
-    (IdMap.bindings
-       (IdMap.filter
-          (fun _ (typ, _) ->
-            match typ with Service | Operation | Resource -> false | _ -> true)
-          shs));
-  Format.fprintf f "@]@;<1 -2>end@]@."
+let print_to_json shs =
+  [%str
+    module To_JSON = struct
+      [%%i Str.value Recursive (List.map to_json (IdMap.bindings shs))]
+    end]
+
+let compute_inputs shapes =
+  let rec traverse inputs ~direct id =
+    if IdSet.mem id inputs then inputs
+    else
+      let inputs = if direct then inputs else IdSet.add id inputs in
+      match IdMap.find_opt id shapes with
+      | None -> inputs
+      | Some (typ, _) -> (
+          match typ with
+          | Blob | Boolean | String | Enum _ | Integer | Long | Float | Double
+          | Timestamp | Document ->
+              inputs
+          | Service | Resource | Operation _ -> assert false
+          | List id | Map (_, id) -> traverse inputs ~direct:false id
+          | Structure l | Union l ->
+              List.fold_left
+                (fun inputs (_, id, _) -> traverse inputs ~direct:false id)
+                inputs l)
+  in
+  IdMap.fold
+    (fun _ (ty, _) inputs ->
+      match ty with
+      | Operation { input; _ } -> traverse inputs ~direct:true input
+      | _ -> inputs)
+    shapes IdSet.empty
 
 let compile dir f =
   let shs = parse (Filename.concat dir f) in
-  let ch =
-    open_out
-      (Filename.concat "generated"
-         (String.concat "_"
-            (String.split_on_char '-' (Filename.chop_suffix f ".json"))
-         ^ ".ml"))
+  let name =
+    let sdk_id =
+      let _, (_, traits) =
+        IdMap.choose
+          (IdMap.filter
+             (fun _ (typ, _) -> match typ with Service -> true | _ -> false)
+             shs)
+      in
+      traits
+      |> List.assoc "aws.api#service"
+      |> Yojson.Safe.Util.member "sdkId"
+      |> Yojson.Safe.Util.to_string
+    in
+    let space_re = Re.(compile (set " -")) in
+    sdk_id |> String.lowercase_ascii |> Re.replace space_re ~f:(fun _ -> "_")
   in
+  let ch = open_out (Filename.concat "generated" (name ^ ".ml")) in
   let f = Format.formatter_of_out_channel ch in
-  Format.fprintf f
-    "module StringMap = Map.Make (struct type t = string let compare = compare \
-     end)@.";
-  print_types f shs;
-  print_constructors f shs;
-  print_to_json f shs;
+  Format.fprintf f "module StringMap = Converters.StringMap@.";
+  let types = print_types shs in
+  let inputs = compute_inputs shs in
+  let input_shapes = IdMap.filter (fun id _ -> IdSet.mem id inputs) shs in
+  let record_constructors = print_constructors input_shapes in
+  let converters = print_to_json input_shapes in
+  Format.fprintf f "%a@." Pprintast.structure
+    ((types :: record_constructors) @ converters);
   close_out ch
 
 let () =
@@ -452,12 +550,26 @@ let () =
   else
     let f = "s3.json" in
     compile dir f
+
 (*
-    let shs = parse (Filename.concat dir f) in
-    Format.printf
-      "module StringMap = Map.Make (struct type t = string let compare = \
-       compare end)@.";
-    List.iteri
-      (fun i sh -> Format.printf "%a" (print_type ~first:(i = 0)) sh)
-      shs
+Aws_lwt.perform S3.list_buckets
+Aws_lwt.paginate S3.list_buckets  ===> stream of responses
+
+type query = string
+type response = string
+
+type ('a, 'b, 'c) operation =
+  { build :  (query -> 'b) -> 'a;
+    parse : response -> 'c }
+
+let perform ~f op =
+   op.build (fun query -> Lwt.bind (f query) (fun resp -> Lwt.return (op.parse resp)))
+;;
+
+let build k ~x ~y = k (x ^ y);;
+let parse x = x, x
+
+let op = {build; parse}
+
+fun f -> perform ~f op;;
 *)

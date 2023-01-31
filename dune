@@ -1,2 +1,3 @@
 (executable (name smithy)
-  (libraries yojson re))
+  (libraries yojson re)
+  (preprocess (pps ppxlib.metaquot)))
