@@ -1,0 +1,4 @@
+(library (modes byte) (name aws)
+  (libraries calendar yojson base64))
+
+(env (_ (flags (:standard -w -30-27-39))))
