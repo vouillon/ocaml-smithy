@@ -2,14 +2,6 @@
 - mli files
 
 - serializer / deserializer      Json / XML
-  ==> mark inputs and ouputs
-
-- float: +/-infinity
-
-- deal especially with operation requests (does not define a type) and
-  errors (define a union)
-
-- constructors only for operation inputs
 
 - validation: length, pattern, range, uniqueItems
 
@@ -21,14 +13,17 @@
     106 aws.protocols#awsJson1_1
     186 aws.protocols#restJson1
 
-=================
+./gradlew :smithy-aws-protocol-tests:build
 
-We print all types
-- direct inputs / outputs
-- errors
-- other types
 
-Constructors for inputs which are not always direct
+Compiling an operation:
+- method
+- host prefix
+- builder function (straight for arguments to JSon)
+  ==> json + host prefix + uri ?
+- code
+- parser function
+- list of errors
 *)
 
 open Yojson.Safe
@@ -904,6 +899,51 @@ let compute_inputs_outputs shapes =
     shapes
     (IdSet.empty, IdSet.empty, IdSet.empty)
 
+(*
+let compile_rest_operation ~shapes nm input output errors traits =
+  prerr_endline nm.identifier;
+  if List.mem_assoc "smithy.api#http" traits then
+    Format.eprintf "OOO %s@." (to_string (List.assoc "smithy.api#http" traits));
+  let http = List.assoc "smithy.api#http" traits in
+  let meth = Util.(http |> member "method" |> to_string) in
+  prerr_endline meth;
+  (*
+    785 DELETE
+   1894 GET
+      1 HEAD
+    188 PATCH
+   2213 POST
+    597 PUT
+*)
+  let uri = Util.(http |> member "uri" |> to_string) in
+  prerr_endline uri;
+  let code = Util.(http |> member "code" |> to_option to_int) in
+  ignore (meth, uri, code);
+  ignore (shapes, nm, input, output, errors, traits)
+*)
+
+let compile_operation ~shapes nm input output errors traits =
+  (* Method: POST, uri: / *)
+  let host_prefix =
+    Option.map
+      (fun e -> Util.(e |> member "hostPrefix" |> to_string))
+      (List.assoc_opt "smithy.api#endpoint" traits)
+  in
+  assert (not (String.contains (Option.value ~default:"" host_prefix) '{'));
+  if List.mem_assoc "smithy.api#endpoint" traits then
+    Format.eprintf "WWW %s@."
+      (to_string (List.assoc "smithy.api#endpoint" traits));
+  ignore (shapes, nm, input, output, errors, traits)
+
+let compile_operations ~shapes =
+  IdMap.iter
+    (fun nm (ty, traits) ->
+      match ty with
+      | Operation { input; output; errors } ->
+          compile_operation ~shapes nm input output errors traits
+      | _ -> ())
+    shapes
+
 let compile dir f =
   let shs = parse (Filename.concat dir f) in
   let service =
@@ -932,13 +972,17 @@ let compile dir f =
   let converters = print_to_json input_shapes in
   let output_shapes = IdMap.filter (fun id _ -> IdSet.mem id outputs) shs in
   let converters' = print_from_json output_shapes in
-
   let toplevel_doc =
     let _, (_, traits) = service in
     match documentation ~shapes:shs traits with
     | None -> []
     | Some doc -> Str.text [ doc ]
   in
+  if
+    let _, (_, traits) = service in
+    List.mem_assoc "aws.protocols#awsJson1_1" traits
+    || List.mem_assoc "aws.protocols#awsJson1_0" traits
+  then compile_operations ~shapes:shs;
   Format.fprintf f "%a@." Pprintast.structure
     (toplevel_doc
     @ Str.module_
