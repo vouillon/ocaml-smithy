@@ -1,0 +1,11 @@
+opam-version: "2.0"
+name: "aws-sdk"
+version: "0.1"
+synopsis: "AWS SDK for OCaml"
+maintainer: "Jérôme Vouillon <jerome.vouillon@gmail.com>"
+authors: "Jérôme Vouillon <jerome.vouillon@gmail.com>"
+license: ""
+homepage: "https://github.com/vouillon/aws-sdk"
+bug-reports: ""
+dev-repo: ""
+build: ["dune" "build" "-p" name "-j" jobs]

@@ -922,7 +922,14 @@ let compile_rest_operation ~shapes nm input output errors traits =
   ignore (shapes, nm, input, output, errors, traits)
 *)
 
+(*
+~parser:From_JSON.result
+~builder:(fun k ~a ?(b =...) ~c -> k (To_Json.structure ...))
+~errors:[("name", fun x -> `Foo (From_Json.foo) x)); ...]
+*)
 let compile_operation ~shapes nm input output errors traits =
+  (* create_JSON_operation
+          ~variant:`AwsJson1_1 ~host_prefix ~builder ~parser ~errors *)
   (* Method: POST, uri: / *)
   let host_prefix =
     Option.map
