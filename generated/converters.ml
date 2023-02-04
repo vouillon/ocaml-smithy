@@ -65,3 +65,16 @@ module From_JSON = struct
 
   let structure l = to_assoc l
 end
+
+let create_JSON_operation ~variant ~host_prefix ~target ~builder ~parser ~errors
+    =
+  let _headers =
+    [
+      ( "Content-Type",
+        match variant with
+        | `AwsJson1_0 -> "application/x-amz-json-1.0"
+        | `AwsJson1_1 -> "application/x-amz-json-1.1" );
+      ("X-Amz-Target", target);
+    ]
+  in
+  ()

@@ -3,6 +3,8 @@
 
 - serializer / deserializer      Json / XML
 
+- timestampFormat
+
 - validation: length, pattern, range, uniqueItems
 
 - documentation
@@ -928,8 +930,10 @@ let compile_rest_operation ~shapes nm input output errors traits =
 ~errors:[("name", fun x -> `Foo (From_Json.foo) x)); ...]
 *)
 let compile_operation ~shapes nm input output errors traits =
-  (* create_JSON_operation
-          ~variant:`AwsJson1_1 ~host_prefix ~builder ~parser ~errors *)
+  (* let operation =
+       Converters.create_JSON_operation
+          ~variant:`AwsJson1_1 ~target:"Service.Operation"
+          ~host_prefix ~builder ~parser ~errors *)
   (* Method: POST, uri: / *)
   let host_prefix =
     Option.map
