@@ -66,9 +66,32 @@ module From_JSON = struct
   let structure l = to_assoc l
 end
 
+(*
+    ?ctx:ctx ->
+    ?headers:Http.Header.t ->
+    ?body:Body.t ->
+    ?chunked:bool ->
+    Http.Method.t ->
+    Uri.t ->
+    (Http.Response.t * Body.t) Lwt.t
+*)
+
+type meth = POST
+
+type request = {
+  uri : Uri.t;
+  meth : meth;
+  headers : (string * string) list;
+  body : string option;
+}
+
+type response = { code : int; body : string }
+type ('a, 'b) operation = { builder : 'a; parser : 'b }
+
 let create_JSON_operation ~variant ~host_prefix ~target ~builder ~parser ~errors
     =
-  let _headers =
+  (* Use hostname, protocol (https if not set) and path from endpoint *)
+  let headers =
     [
       ( "Content-Type",
         match variant with
@@ -77,4 +100,27 @@ let create_JSON_operation ~variant ~host_prefix ~target ~builder ~parser ~errors
       ("X-Amz-Target", target);
     ]
   in
-  ()
+  {
+    builder =
+      (fun endpoint ->
+        builder (fun body ->
+            assert (Uri.host endpoint <> None);
+            {
+              uri =
+                Uri.with_uri
+                  ~host:
+                    (Option.map
+                       (fun host_prefix ->
+                         host_prefix
+                         ^ Uri.host_with_default ~default:"" endpoint)
+                       host_prefix)
+                  endpoint;
+              meth = POST;
+              headers;
+              body = Some body;
+            }));
+    parser =
+      (fun response ->
+        if response.code = 200 then Result.Ok (parser response)
+        else Result.error "" (*ZZZ*));
+  }

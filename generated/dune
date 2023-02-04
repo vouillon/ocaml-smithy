@@ -2,7 +2,7 @@
  (name aws)
  (public_name aws-sdk)
  (modes byte)
- (libraries calendar yojson base64))
+ (libraries calendar yojson base64 uri))
 
 (env
  (_
