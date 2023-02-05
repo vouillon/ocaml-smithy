@@ -477,21 +477,14 @@ let documentation ~shapes doc =
         Some (format_children ~shapes ~in_anchor:false ~toplevel:true children)
     | _ -> assert false
 
-let documentation ~shapes ?extra traits =
+let documentation ~shapes traits =
   match List.assoc_opt "smithy.api#documentation" traits with
   | None -> None
   | Some doc -> (
       let doc = Yojson.Safe.Util.to_string doc in
       match documentation ~shapes doc with
-      | Some doc ->
-          let doc =
-            match extra with None -> doc | Some extra -> doc ^ "\n\n" ^ extra
-          in
-          Some (Docstrings.docstring doc loc)
-      | None -> (
-          match extra with
-          | None -> None
-          | Some extra -> Some (Docstrings.docstring extra loc)))
+      | Some doc -> Some (Docstrings.docstring doc loc)
+      | None -> None)
 
 let default_value shapes typ default =
   match default with
@@ -509,7 +502,7 @@ let default_value shapes typ default =
 let type_ident id =
   Typ.constr (Location.mknoloc (Longident.Lident (type_name id))) []
 
-let print_constructor shapes name fields =
+let constructor_parameters ~shapes ~fields ~body =
   let has_optionals =
     List.exists
       (fun (_, _, traits) ->
@@ -517,6 +510,29 @@ let print_constructor shapes name fields =
         || not (List.mem_assoc "smithy.api#required" traits))
       fields
   in
+  List.fold_right
+    (fun field (expr : Parsetree.expression) ->
+      let nm, typ, traits' = field in
+      match List.assoc_opt "smithy.api#default" traits' with
+      | Some default when default <> `Null ->
+          Exp.fun_
+            (Optional (field_name nm))
+            (Some (default_value shapes typ default))
+            (Pat.var (Location.mknoloc (field_name nm)))
+            expr
+      | _ ->
+          let optional = optional_member field in
+          Exp.fun_
+            (if optional then Optional (field_name nm)
+            else Labelled (field_name nm))
+            None
+            (Pat.var (Location.mknoloc (field_name nm)))
+            expr)
+    fields
+    (if has_optionals || fields = [] then Exp.fun_ Nolabel None [%pat? ()] body
+    else body)
+
+let print_constructor shapes name fields =
   let body =
     Exp.constraint_
       (Exp.record
@@ -528,28 +544,7 @@ let print_constructor shapes name fields =
          None)
       (type_ident name)
   in
-  let expr =
-    List.fold_right
-      (fun field (expr : Parsetree.expression) ->
-        let nm, typ, traits' = field in
-        match List.assoc_opt "smithy.api#default" traits' with
-        | Some default when default <> `Null ->
-            Exp.fun_
-              (Optional (field_name nm))
-              (Some (default_value shapes typ default))
-              (Pat.var (Location.mknoloc (field_name nm)))
-              expr
-        | _ ->
-            let optional = optional_member field in
-            Exp.fun_
-              (if optional then Optional (field_name nm)
-              else Labelled (field_name nm))
-              None
-              (Pat.var (Location.mknoloc (field_name nm)))
-              expr)
-      fields
-      (if has_optionals then Exp.fun_ Nolabel None [%pat? ()] body else body)
-  in
+  let expr = constructor_parameters ~shapes ~fields ~body in
   [%stri let [%p Pat.var (Location.mknoloc (type_name name))] = [%e expr]]
 
 let print_constructors shapes =
@@ -571,18 +566,21 @@ let type_constructor ?info ?arg_type nm =
 let print_type ?heading ~inputs ~shapes (nm, (sh, traits)) =
   let text = Option.map (fun h -> [ Docstrings.docstring h loc ]) heading in
   let docs =
-    let extra =
-      match sh with
-      | Structure l when l <> [] && IdSet.mem nm inputs ->
-          Some
-            ("See associated record builder function {!val:" ^ type_name nm
-           ^ "}.")
-      | _ -> None
-    in
-    Option.map
-      (fun d -> { Docstrings.docs_pre = Some d; docs_post = None })
-      (documentation ~shapes ?extra traits)
+    Some
+      {
+        Docstrings.docs_pre = documentation ~shapes traits;
+        docs_post =
+          (match sh with
+          | Structure l when l <> [] && IdSet.mem nm inputs ->
+              Some
+                (Docstrings.docstring
+                   ("See associated record builder function {!val:"
+                  ^ type_name nm ^ "}.")
+                   loc)
+          | _ -> None);
+      }
   in
+
   let manifest_type manifest =
     Type.mk ?text ?docs ~manifest (Location.mknoloc (type_name nm))
   in
@@ -705,6 +703,21 @@ let member_name ?(name = "smithy.api#jsonName") (nm, _, traits) =
 let pat_construct nm =
   Pat.construct (Location.mknoloc (Longident.Lident (constr_name nm)))
 
+let structure_json_converter fields =
+  let path = Longident.(Ldot (Lident "Converters", "To_JSON")) in
+  [%expr
+    Converters.To_JSON.structure
+      [%e
+        List.fold_right
+          (fun ((nm, typ, _) as field) lst ->
+            let optional = optional_member field in
+            [%expr
+              ( [%e Exp.constant (Const.string (member_name field))],
+                [%e (converter ~path ~sparse:optional) typ]
+                  [%e ident (field_name nm ^ "'")] )
+              :: [%e lst]])
+          fields [%expr []]]]
+
 let to_json (name, (sh, traits)) =
   let path = Longident.(Ldot (Lident "Converters", "To_JSON")) in
   let nm = type_name name ^ "'" in
@@ -759,20 +772,7 @@ let to_json (name, (sh, traits)) =
                             ))
                           l)
                        Closed)
-                    [%expr
-                      Converters.To_JSON.structure
-                        [%e
-                          List.fold_right
-                            (fun ((nm, typ, _) as field) lst ->
-                              let optional = optional_member field in
-                              [%expr
-                                ( [%e
-                                    Exp.constant
-                                      (Const.string (member_name field))],
-                                  [%e (converter ~path ~sparse:optional) typ]
-                                    [%e ident (field_name nm ^ "'")] )
-                                :: [%e lst]])
-                            l [%expr []]]];
+                    (structure_json_converter l);
                 ]
           | Union l ->
               [%expr
@@ -966,22 +966,58 @@ let compile_rest_operation ~shapes nm input output errors traits =
 *)
 
 (*
-~parser:From_JSON.result
 ~builder:(fun k ~a ?(b =...) ~c -> k (To_Json.structure ...))
 ~errors:[("name", (retryable, fun x -> `Foo (From_Json.foo) x))); ...]
 *)
 let compile_operation ~service_info ~shapes nm { input; output; errors } traits
     =
   let docs =
-    Option.map
-      (fun d -> { Docstrings.docs_pre = Some d; docs_post = None })
-      (documentation ~shapes traits)
+    Some
+      {
+        Docstrings.docs_pre =
+          (if input.namespace = "smithy.api" then None
+          else
+            Some
+              (Docstrings.docstring
+                 ("See type {!type:" ^ type_name input
+                ^ "} for a description of the parameters")
+                 loc));
+        docs_post = documentation ~shapes traits;
+      }
   in
   (* Method: POST, uri: / *)
   let host_prefix =
     Option.map
       (fun e -> Util.(e |> member "hostPrefix" |> to_string))
       (List.assoc_opt "smithy.api#endpoint" traits)
+  in
+  let builder =
+    let fields =
+      if input = { namespace = "smithy.api"; identifier = "Unit" } then []
+      else
+        match IdMap.find input shapes with
+        | Structure l, _ -> l
+        | _ -> assert false
+    in
+    [%expr
+      fun k ->
+        [%e
+          constructor_parameters ~shapes ~fields
+            ~body:
+              (List.fold_left
+                 (fun expr (nm, _, _) ->
+                   Exp.let_ Nonrecursive
+                     [
+                       Vb.mk
+                         (Pat.var (Location.mknoloc (field_name nm ^ "'")))
+                         (ident (field_name nm));
+                     ]
+                     expr)
+                 [%expr
+                   k
+                     (let open! To_JSON in
+                     [%e structure_json_converter fields])]
+                 fields)]]
   in
   let errors = service_info.errors @ errors in
   let errors =
@@ -1005,7 +1041,6 @@ let compile_operation ~service_info ~shapes nm { input; output; errors } traits
       errors [%expr []]
   in
   assert (not (String.contains (Option.value ~default:"" host_prefix) '{'));
-  ignore (shapes, nm, input, output, errors, traits);
   Str.value Nonrecursive
     [
       Vb.mk ?docs
@@ -1020,7 +1055,7 @@ let compile_operation ~service_info ~shapes nm { input; output; errors } traits
                   | Some host_prefix ->
                       [%expr Some [%e Exp.constant (Const.string host_prefix)]]]
               ~target:[%e Exp.constant (Const.string nm.identifier)]
-              ~builder:(fun k () -> k `Null)
+              ~builder:[%e builder]
               ~parser:
                 [%e
                   Exp.ident
