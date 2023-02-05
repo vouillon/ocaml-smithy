@@ -17,15 +17,20 @@
 
 ./gradlew :smithy-aws-protocol-tests:build
 
+- doc:
+  - also search references in field of input / output ==> {!type-t.field}
+  - document key of each StringMap.t  ('a, 'b) map = 'b StringMap.t ???
+
+Things to consider
+- endpoint configuration
+- streaming
+- pagination ==> modification of the request / access to the response
+- retries ==> retryable errors / idempotency
+- presigned URLs
 
 Compiling an operation:
-- method
-- host prefix
 - builder function (straight for arguments to JSon)
   ==> json + host prefix + uri ?
-- code
-- parser function
-- list of errors
 *)
 
 open Yojson.Safe
@@ -68,14 +73,18 @@ type shape =
   | Map of shape_id * shape_id
   | Structure of (string * shape_id * traits) list
   | Union of (string * shape_id * traits) list
-  | Service of {
-      version : string;
-      operations : shape_id list;
-      resources : shape_id list;
-      errors : shape_id list;
-    }
+  | Service of service
   | Resource
-  | Operation of { input : shape_id; output : shape_id; errors : shape_id list }
+  | Operation of operation
+
+and service = {
+  version : string;
+  operations : shape_id list;
+  resources : shape_id list;
+  errors : shape_id list;
+}
+
+and operation = { input : shape_id; output : shape_id; errors : shape_id list }
 
 let parse_shape (id, sh) =
   let typ = Util.(sh |> member "type" |> to_string) in
@@ -232,7 +241,10 @@ let type_name id =
       | "Float" | "Double" -> "float"
       | "Timestamp" -> "CalendarLib.Calendar.t"
       | "Document" -> "Yojson.Safe.t"
-      | _ -> assert false)
+      | "Unit" -> "unit"
+      | _ ->
+          prerr_endline id.identifier;
+          assert false)
   | _ -> uncapitalized_identifier id.identifier
 
 let field_name = uncapitalized_identifier
@@ -346,13 +358,42 @@ let rec fix_list l =
   | elt :: rem -> elt :: fix_list rem
   | [] -> []
 
+let rec format_dl ~format l dts (dds : _ list) =
+  let format_group () =
+    "{- "
+    ^ String.concat " / "
+        (List.rev_map
+           (fun s -> "{b " ^ s ^ "}")
+           (List.filter (fun s -> not (empty_text s)) dts))
+    ^ " "
+    ^ (match dds with
+      | [ dd ] -> dd
+      | _ ->
+          "\n{ul "
+          ^ String.concat " " (List.rev_map (fun s -> "{- " ^ s ^ "}") dds)
+          ^ "}")
+    ^ "}"
+  in
+  match l with
+  | Element ("dt", [], children) :: rem ->
+      if dds <> [] then
+        format_group () ^ format_dl ~format rem (format children :: dts) []
+      else format_dl ~format rem (format children :: dts) []
+  | Element ("dd", [], children) :: rem ->
+      format_dl ~format rem dts (format children :: dds)
+  | Element _ :: _ -> assert false
+  | Text txt :: rem ->
+      assert (empty_text txt);
+      format_dl ~format rem dts dds
+  | [] -> if dts <> [] then format_group () else ""
+
 let rec format ~shapes ~in_anchor ?(in_list = false) ~toplevel doc =
   match doc with
   | Text txt -> escape_text txt
   | Element ("p", _, children) ->
       let s = format_children ~shapes ~in_anchor ~toplevel:false children in
       if toplevel then s ^ "\n\n" else s
-  | Element ("code", _, children) ->
+  | Element ("code", _, children) | Element ("a", [], children) ->
       let s = escape_code (children_text children) in
       let reference =
         IdMap.filter (fun { identifier; _ } _ -> identifier = s) shapes
@@ -362,9 +403,7 @@ let rec format ~shapes ~in_anchor ?(in_list = false) ~toplevel doc =
         match typ with
         | Service _ | Resource -> "[" ^ s ^ "]"
         | Operation _ ->
-            "[" ^ s ^ "]"
-            (*"{!val:" ^ uncapitalized_identifier s ^ "}"*)
-            (*ZZZ FIX*)
+            "[" ^ s ^ "]" (*ZZZZ "{!val:" ^ uncapitalized_identifier s ^ "}" *)
         | _ -> "{!type:" ^ uncapitalized_identifier s ^ "}"
       else "[" ^ s ^ "]"
   | Element (("i" | "replaceable" | "title"), _, children) ->
@@ -381,8 +420,6 @@ let rec format ~shapes ~in_anchor ?(in_list = false) ~toplevel doc =
       let url = List.assoc "href" attr in
       let s = format_children ~shapes ~in_anchor:true ~toplevel children in
       if empty_text url then s else "{{: " ^ url ^ " }" ^ s ^ "}"
-  | Element ("a", [], children) ->
-      format_children ~shapes ~in_anchor ~toplevel:false children
   | Element ("ul", _, children) ->
       "\n{ul "
       ^ format_children ~shapes ~in_anchor ~in_list:true ~toplevel:false
@@ -393,13 +430,17 @@ let rec format ~shapes ~in_anchor ?(in_list = false) ~toplevel doc =
       if in_list then "{- " ^ s ^ "}" else s
   | Element ("dl", _, children) ->
       "\n{ul "
-      ^ format_children ~shapes ~in_anchor ~toplevel:false children
+      ^ format_dl
+          ~format:(format_children ~shapes ~in_anchor ~toplevel:false)
+          children [] []
       ^ "}\n"
+  (*
   | Element ("dt", _, children) ->
       let s = format_children ~shapes ~in_anchor ~toplevel:false children in
       if empty_text s then "{- " else "{- {b " ^ s ^ "} "
   | Element ("dd", _, children) ->
       format_children ~shapes ~in_anchor ~toplevel:false children ^ "}"
+*)
   | Element ("ol", _, children) ->
       "\n{ol "
       ^ format_children ~shapes ~in_anchor ~in_list:true ~toplevel:false
@@ -927,33 +968,81 @@ let compile_rest_operation ~shapes nm input output errors traits =
 (*
 ~parser:From_JSON.result
 ~builder:(fun k ~a ?(b =...) ~c -> k (To_Json.structure ...))
-~errors:[("name", fun x -> `Foo (From_Json.foo) x)); ...]
+~errors:[("name", (retryable, fun x -> `Foo (From_Json.foo) x))); ...]
 *)
-let compile_operation ~shapes nm input output errors traits =
-  (* let operation =
-       Converters.create_JSON_operation
-          ~variant:`AwsJson1_1 ~target:"Service.Operation"
-          ~host_prefix ~builder ~parser ~errors *)
+let compile_operation ~service_info ~shapes nm { input; output; errors } traits
+    =
+  let docs =
+    Option.map
+      (fun d -> { Docstrings.docs_pre = Some d; docs_post = None })
+      (documentation ~shapes traits)
+  in
   (* Method: POST, uri: / *)
   let host_prefix =
     Option.map
       (fun e -> Util.(e |> member "hostPrefix" |> to_string))
       (List.assoc_opt "smithy.api#endpoint" traits)
   in
+  let errors = service_info.errors @ errors in
+  let errors =
+    List.fold_right
+      (fun name lst ->
+        [%expr
+          ( [%e Exp.constant (Const.string name.identifier)],
+            fun x ->
+              [%e
+                Exp.variant
+                  (constr_name name.identifier)
+                  (Some
+                     [%expr
+                       [%e
+                         Exp.ident
+                           (Location.mknoloc
+                              (Longident.Ldot
+                                 (Lident "From_JSON", type_name name)))]
+                         x])] )
+          :: [%e lst]])
+      errors [%expr []]
+  in
   assert (not (String.contains (Option.value ~default:"" host_prefix) '{'));
-  if List.mem_assoc "smithy.api#endpoint" traits then
-    Format.eprintf "WWW %s@."
-      (to_string (List.assoc "smithy.api#endpoint" traits));
-  ignore (shapes, nm, input, output, errors, traits)
+  ignore (shapes, nm, input, output, errors, traits);
+  Str.value Nonrecursive
+    [
+      Vb.mk ?docs
+        (Pat.var (Location.mknoloc (type_name nm)))
+        [%expr
+          fun () ->
+            Converters.create_JSON_operation ~variant:`AwsJson1_0
+              ~host_prefix:
+                [%e
+                  match host_prefix with
+                  | None -> [%expr None]
+                  | Some host_prefix ->
+                      [%expr Some [%e Exp.constant (Const.string host_prefix)]]]
+              ~target:[%e Exp.constant (Const.string nm.identifier)]
+              ~builder:(fun k () -> k `Null)
+              ~parser:
+                [%e
+                  Exp.ident
+                    (Location.mknoloc
+                       (if output.namespace = "smithy.api" then
+                        Longident.(
+                          Ldot
+                            ( Ldot (Lident "Converters", "From_JSON"),
+                              type_name output ))
+                       else Longident.Ldot (Lident "From_JSON", type_name output)))]
+              ~errors:[%e errors]];
+    ]
 
-let compile_operations ~shapes =
-  IdMap.iter
-    (fun nm (ty, traits) ->
-      match ty with
-      | Operation { input; output; errors } ->
-          compile_operation ~shapes nm input output errors traits
-      | _ -> ())
-    shapes
+let compile_operations ~service_info ~shapes =
+  List.rev
+  @@ IdMap.fold
+       (fun nm (ty, traits) rem ->
+         match ty with
+         | Operation info ->
+             compile_operation ~service_info ~shapes nm info traits :: rem
+         | _ -> rem)
+       shapes []
 
 let compile dir f =
   let shs = parse (Filename.concat dir f) in
@@ -989,11 +1078,17 @@ let compile dir f =
     | None -> []
     | Some doc -> Str.text [ doc ]
   in
-  if
-    let _, (_, traits) = service in
-    List.mem_assoc "aws.protocols#awsJson1_1" traits
-    || List.mem_assoc "aws.protocols#awsJson1_0" traits
-  then compile_operations ~shapes:shs;
+  let service_info =
+    match service with _, (Service info, _) -> info | _ -> assert false
+  in
+  let operations =
+    if
+      let _, (_, traits) = service in
+      List.mem_assoc "aws.protocols#awsJson1_1" traits
+      || List.mem_assoc "aws.protocols#awsJson1_0" traits
+    then compile_operations ~service_info ~shapes:shs
+    else []
+  in
   Format.fprintf f "%a@." Pprintast.structure
     (toplevel_doc
     @ Str.module_
@@ -1004,7 +1099,9 @@ let compile dir f =
                  Longident.(Ldot (Lident "Converters", "StringMap")))))
       :: Str.text [ Docstrings.docstring "{1 Type definitions}" loc ]
     @ (types :: Str.text [ Docstrings.docstring "{1 Record constructors}" loc ])
-    @ record_constructors @ converters @ converters');
+    @ record_constructors @ converters @ converters'
+    @ Str.text [ Docstrings.docstring "{1 Operations}" loc ]
+    @ operations);
   close_out ch
 
 let () =

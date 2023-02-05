@@ -1,3 +1,8 @@
 (executable (name smithy)
   (libraries yojson re markup)
   (preprocess (pps ppxlib.metaquot)))
+
+(env
+ (_
+  (flags
+   (:standard -w -30-69))))

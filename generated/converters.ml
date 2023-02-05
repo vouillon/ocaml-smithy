@@ -64,6 +64,7 @@ module From_JSON = struct
       StringMap.empty (to_assoc x)
 
   let structure l = to_assoc l
+  let unit _ = ()
 end
 
 (*
@@ -86,7 +87,13 @@ type request = {
 }
 
 type response = { code : int; body : string }
-type ('a, 'b) operation = { builder : 'a; parser : 'b }
+
+type (+'perform, -'result, +'response, +'error) operation = {
+  builder : Uri.t -> (request -> 'result) -> 'perform;
+  parser : response -> ('response, 'error) Result.t;
+}
+
+type retryable = Retryable | Throttling | Non_retryable
 
 let create_JSON_operation ~variant ~host_prefix ~target ~builder ~parser ~errors
     =
@@ -102,25 +109,31 @@ let create_JSON_operation ~variant ~host_prefix ~target ~builder ~parser ~errors
   in
   {
     builder =
-      (fun endpoint ->
+      (fun endpoint k ->
         builder (fun body ->
+            (*ZZZ*)
             assert (Uri.host endpoint <> None);
-            {
-              uri =
-                Uri.with_uri
-                  ~host:
-                    (Option.map
-                       (fun host_prefix ->
-                         host_prefix
-                         ^ Uri.host_with_default ~default:"" endpoint)
-                       host_prefix)
-                  endpoint;
-              meth = POST;
-              headers;
-              body = Some body;
-            }));
+            k
+              {
+                uri =
+                  Uri.with_uri
+                    ~host:
+                      (Option.map
+                         (fun host_prefix ->
+                           host_prefix
+                           ^ Uri.host_with_default ~default:"" endpoint)
+                         host_prefix)
+                    endpoint;
+                meth = POST;
+                headers;
+                body = Some (Yojson.Safe.to_string body);
+              }));
     parser =
       (fun response ->
-        if response.code = 200 then Result.Ok (parser response)
-        else Result.error "" (*ZZZ*));
+        if response.code = 200 then
+          Result.Ok (parser (Yojson.Safe.from_string response.body))
+        else
+          Result.error
+            (List.assoc "foo" (*ZZZ*) errors
+               (Yojson.Safe.from_string response.body)));
   }
