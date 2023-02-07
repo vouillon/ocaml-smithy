@@ -913,7 +913,7 @@ let print_to_xml shs =
 let query_alt_name ~protocol ~traits =
   match
     if protocol <> `Ec2Query then None
-    else List.assoc_opt "smithy.api#ec2QueryName" traits
+    else List.assoc_opt "aws.protocols#ec2QueryName" traits
   with
   | Some name -> Some (Yojson.Safe.Util.to_string name)
   | None -> (
@@ -925,9 +925,9 @@ let field_graph_converter ~protocol ?param ((nm, typ, traits) as field) =
   let path = Longident.(Ldot (Lident "Converters", "To_JSON")) in
   let optional = param = None && optional_member field in
   let name =
-    Exp.constant
-      (Const.string
-         (Option.value ~default:nm (query_alt_name ~protocol ~traits)))
+    let name = Option.value ~default:nm (query_alt_name ~protocol ~traits) in
+    assert (protocol <> `Ec2Query || String.capitalize_ascii name = name);
+    Exp.constant (Const.string name)
   in
   let flat = flattened_member field in
 
