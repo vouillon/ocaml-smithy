@@ -5,7 +5,7 @@
 
 - timestampFormat
 
-- validation: length, pattern, range, uniqueItems
+- validation: length, pattern, range, uniqueItems  (put that in the documentation?)
 
 - documentation
 
@@ -19,7 +19,6 @@
 
 - doc:
   - also search references in field of input / output ==> {!type-t.field}
-  - document key of each StringMap.t  ('a, 'b) map = 'b StringMap.t ???
 
 Things to consider
 - endpoint configuration
@@ -827,7 +826,7 @@ let to_xml (name, (sh, traits)) =
              | Long -> [%expr Converters.To_XML.long [%e ident nm]]
              | Float | Double -> [%expr Converters.To_XML.float [%e ident nm]]
              | Timestamp -> [%expr Converters.To_XML.timestamp [%e ident nm]]
-             | Document -> [%expr Converters.To_XML.document [%e ident nm]]
+             | Document -> assert false
              | List (id, traits') ->
                  let sparse = List.mem_assoc "smithy.api#sparse" traits in
                  assert (not sparse);
@@ -1130,7 +1129,7 @@ let from_json (name, (sh, traits)) =
                                   [%e
                                     Exp.constant
                                       (Const.string (member_name field))]
-                                  x)] ))
+                                  x)] )) (*ZZZ Not_found? *)
                        l)
                     None]]
           | Union l ->
@@ -1151,22 +1150,6 @@ let from_json (name, (sh, traits)) =
                              [%expr [%e (converter ~path ~sparse:false) typ] x])))
                    l
                 @ [ Exp.case [%pat? _] [%expr assert false] ])
-          (*
-                  [
-                    [%e
-                      Exp.match_ (ident nm)
-                        (List.map
-                           (fun ((nm, typ, _) as constr) ->
-                             Exp.case
-                               (pat_construct nm (Some ([], [%pat? x])))
-                               [%expr
-                                 [%e
-                                   Exp.constant
-                                     (Const.string (member_name constr))],
-                                   [%e (converter ~path ~sparse:false) typ] x])
-                           l)];
-                  ]]
-*)
           | Service _ | Resource | Operation _ -> assert false)
           (type_ident name)))
 
@@ -1174,6 +1157,146 @@ let print_from_json shs =
   [%str
     module From_JSON = struct
       [%%i Str.value Recursive (List.map from_json (IdMap.bindings shs))]
+    end]
+
+let from_xml (name, (sh, traits)) =
+  let path = Longident.(Ldot (Lident "Converters", "From_XML")) in
+  let nm = type_name name ^ "'" in
+  let wrap e =
+    match sh with List _ | Map _ -> [%expr fun ?flat -> [%e e]] | _ -> e
+  in
+  Vb.mk
+    (Pat.var (Location.mknoloc (type_name name)))
+    (wrap
+       (Exp.fun_ Nolabel None
+          [%pat? ([%p Pat.var (Location.mknoloc nm)] : Converters.From_XML.t)]
+          (Exp.constraint_
+             (match sh with
+             | Blob -> [%expr Converters.From_XML.blob [%e ident nm]]
+             | Boolean -> [%expr Converters.From_XML.boolean [%e ident nm]]
+             | String -> [%expr Converters.From_XML.string [%e ident nm]]
+             | Enum l ->
+                 Exp.match_
+                   [%expr Converters.From_XML.string [%e ident nm]]
+                   (List.map
+                      (fun ((nm, _, _) as enum) ->
+                        Exp.case
+                          (Pat.constant
+                             (Const.string
+                                (member_name ~name:"smithy.api#enumValue" enum)))
+                          (Exp.construct
+                             (Location.mknoloc
+                                (Longident.Lident (constr_name nm)))
+                             None))
+                      l
+                   @ [ Exp.case [%pat? _] [%expr assert false] ])
+             | Integer -> [%expr Converters.From_XML.integer [%e ident nm]]
+             | Long -> [%expr Converters.From_XML.long [%e ident nm]]
+             | Float | Double -> [%expr Converters.From_XML.float [%e ident nm]]
+             | Timestamp -> [%expr Converters.From_XML.timestamp [%e ident nm]]
+             | Document -> assert false
+             | List (id, traits') ->
+                 let sparse = List.mem_assoc "smithy.api#sparse" traits in
+                 assert (not sparse);
+                 let name =
+                   Option.map Yojson.Safe.Util.to_string
+                     (List.assoc_opt "smithy.api#xmlName" traits')
+                 in
+                 ( [%expr Converters.From_XML.list] |> fun e ->
+                   match name with
+                   | None -> e
+                   | Some name ->
+                       [%expr
+                         [%e e] ~name:[%e Exp.constant (Const.string name)]] )
+                 |> fun e ->
+                 [%expr
+                   [%e e] [%e converter ~path ~sparse id] ?flat [%e ident nm]]
+             | Map ((_key, key_traits), (value, value_traits)) ->
+                 let sparse = List.mem_assoc "smithy.api#sparse" traits in
+                 assert (not sparse);
+                 let key_name =
+                   Option.map Yojson.Safe.Util.to_string
+                     (List.assoc_opt "smithy.api#xmlName" key_traits)
+                 in
+                 let value_name =
+                   Option.map Yojson.Safe.Util.to_string
+                     (List.assoc_opt "smithy.api#xmlName" value_traits)
+                 in
+                 ( ( [%expr Converters.From_XML.map] |> fun e ->
+                     match key_name with
+                     | None -> e
+                     | Some nm ->
+                         [%expr
+                           [%e e] ~key_name:[%e Exp.constant (Const.string nm)]]
+                   )
+                 |> fun e ->
+                   match value_name with
+                   | None -> e
+                   | Some nm ->
+                       [%expr
+                         [%e e] ~value_name:[%e Exp.constant (Const.string nm)]]
+                 )
+                 |> fun e ->
+                 [%expr [%e e] [%e converter ~path ~sparse value] [%e ident nm]]
+             | Structure [] -> [%expr ()]
+             | Structure l ->
+                 let x = ident nm in
+                 [%expr
+                   [%e
+                     Exp.record
+                       (List.map
+                          (fun ((nm, typ, _) as field) ->
+                            ( Location.mknoloc (Longident.Lident (field_name nm)),
+                              let optional = optional_member field in
+                              let name =
+                                Exp.constant
+                                  (Const.string
+                                     (member_name ~name:"smithy.api#xmlName"
+                                        field))
+                              in
+                              let flat = flattened_member field in
+                              let conv = converter ~path ~sparse:false typ in
+                              if flat then
+                                let e =
+                                  [%expr
+                                    Converters.From_XML.flattened_field
+                                      [%e name] [%e conv] [%e x]]
+                                in
+                                if optional then [%expr Some [%e e]] else e
+                              else
+                                [%expr
+                                  [%e
+                                    if optional then
+                                      [%expr Converters.From_XML.opt_field]
+                                    else [%expr Converters.From_XML.field]]
+                                    [%e name] [%e conv] [%e x]] ))
+                          l)
+                       None]]
+             | Union l ->
+                 Exp.match_
+                   [%expr Converters.From_XML.union [%e ident nm]]
+                   (List.map
+                      (fun ((nm, typ, _) as constr) ->
+                        Exp.case
+                          [%pat?
+                            ( [%p
+                                Pat.constant (Const.string (member_name constr))],
+                              x )]
+                          (Exp.construct
+                             (Location.mknoloc
+                                (Longident.Lident (constr_name nm)))
+                             (Some
+                                [%expr
+                                  [%e (converter ~path ~sparse:false) typ] x])))
+                      l
+                   @ [ Exp.case [%pat? _] [%expr assert false] ])
+             | Service _ | Resource | Operation _ -> assert false)
+             (type_ident name))))
+
+let print_from_xml shs =
+  [%str
+    module From_XML = struct
+      [%%i Str.value Recursive (List.map from_xml (IdMap.bindings shs))]
     end]
 
 let compute_inputs_outputs shapes =
@@ -1404,7 +1527,7 @@ let compile dir f =
   let converters' =
     match protocol with
     | `AwsJson1_0 | `AwsJson1_1 | `RestJson1 -> print_from_json output_shapes
-    | `RestXml | `AwsQuery | `Ec2Query -> [] (*ZZZ*)
+    | `RestXml | `AwsQuery | `Ec2Query -> print_from_xml output_shapes
   in
   let toplevel_doc =
     let _, (_, traits) = service in

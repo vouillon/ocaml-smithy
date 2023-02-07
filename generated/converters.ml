@@ -5,14 +5,14 @@ module StringMap = Map.Make (struct
 end)
 
 module Timestamp = struct
-  let to_date_time t =
-    CalendarLib.Printer.Calendar.sprint "%FT%RZ" t (*ZZZ Check*)
-
-  let to_epoch_seconds = CalendarLib.Calendar.to_unixfloat
+  let to_date_time t = CalendarLib.Printer.Calendar.sprint "%FT%RZ" t
+  let time_secfrac_re = Re.(compile (seq [ char '.'; rep (rg '0' '9') ]))
 
   let from_date_time t =
-    CalendarLib.Printer.CalendarPrinter.from_fstring "%FT%TZ" t
+    CalendarLib.Printer.CalendarPrinter.from_fstring "%FT%TZ"
+      (Re.replace_string time_secfrac_re ~by:"" t)
 
+  let to_epoch_seconds = CalendarLib.Calendar.to_unixfloat
   let from_epoch_seconds = CalendarLib.Calendar.from_unixfloat
 end
 
@@ -173,64 +173,92 @@ module To_XML = struct
   let document _ = assert false
   let option f x = match x with None -> [] | Some x -> f x
 
-  let list ?(name = "values") f ?flat x =
+  let list ?(name = "member") f ?flat x =
     let name = Option.value ~default:name flat in
-    let l = List.map (fun y -> `Elt (name, f y)) x in
-    if flat <> None then l else [ `Elt ("values", l) ]
+    List.map (fun y -> `Elt (name, f y)) x
 
   let map ?(key_name = "key") ?(value_name = "value") f ?flat x =
     let entry_name = Option.value ~default:"entry" flat in
-    let values =
-      List.map
-        (fun (k, v) ->
-          `Elt
-            ( entry_name,
-              [ `Elt (key_name, [ `Data k ]); `Elt (value_name, f v) ] ))
-        (StringMap.bindings x)
-    in
-    if flat <> None then values else [ `Elt ("values", values) ]
+    List.map
+      (fun (k, v) ->
+        `Elt
+          (entry_name, [ `Elt (key_name, [ `Data k ]); `Elt (value_name, f v) ]))
+      (StringMap.bindings x)
 
-  let field name f x = [ `Elt ("name", f x) ]
+  let field name f x = [ `Elt (name, f x) ]
   let structure l = List.concat l
 end
 
 module From_XML = struct
-  let string i =
-    match Xmlm.peek i with
-    | `Data d ->
-        ignore (Xmlm.input i);
-        d
-    | `El_end -> ""
-    | _ -> assert false
+  type t = [ `Data of string | `Elt of string * t ] list
 
-  let boolean i =
-    match string i with "true" -> true | "false" -> false | _ -> assert false
+  let string x = match x with [ `Data d ] -> d | [] -> "" | _ -> assert false
 
-  let blob i = Base64.decode_exn (string i)
-  let integer i = Int32.of_string (string i)
-  let long i = Int64.of_string (string i)
+  let boolean x =
+    match string x with "true" -> true | "false" -> false | _ -> assert false
 
-  let float i =
-    match string i with
+  let blob x = Base64.decode_exn (string x)
+  let integer x = Int32.of_string (string x)
+  let long x = Int64.of_string (string x)
+
+  let float x =
+    match string x with
     | "NaN" -> 0. /. 0.
     | "Infinity" -> 1. /. 0.
     | "-Infinity" -> -1. /. 0.
     | x -> float_of_string x
 
-  let timestamp i = Timestamp.from_date_time (string i)
+  let timestamp x = Timestamp.from_date_time (string x)
   let document _ = assert false
 
-  open Yojson.Safe.Util
+  let select_field name x =
+    List.filter
+      (fun v -> match v with `Elt (name', _) -> name = name' | _ -> false)
+      x
 
-  let option f x = if x = `Null then None else Some (f x)
-  let list f x = List.map f (to_list x)
+  let field name f x =
+    match select_field name x with
+    | [ `Elt (_, v) ] -> f v
+    | _ -> assert false (*ZZZ*)
 
-  let map f x =
+  let opt_field name f x =
+    match select_field name x with
+    | [ `Elt (_, v) ] -> Some (f v)
+    | [] -> None
+    | _ -> assert false (*ZZZ*)
+
+  let flattened_field name (f : ?flat:_ -> _) x =
+    f ~flat:true (select_field name x)
+
+  let structure l =
     List.fold_left
-      (fun m (k, v) -> StringMap.add k (f v) m)
-      StringMap.empty (to_assoc x)
+      (fun m x ->
+        match x with
+        | `Data _ -> assert false
+        | `Elt (k, v) ->
+            StringMap.update k
+              (fun l -> Some (v :: Option.value ~default:[] l))
+              m)
+      StringMap.empty l
 
-  let structure l = to_assoc l
+  let list ?(name = "values") f ?(flat = false) x =
+    List.map
+      (fun v ->
+        match v with
+        | `Elt (nm, v) when flat || nm = name -> f v
+        | _ -> assert false)
+      x
+
+  let map ?(key_name = "key") ?(value_name = "value") f ?(flat = false) x =
+    List.fold_left
+      (fun m v ->
+        match v with
+        | `Elt (nm, v) when flat || nm = "entry" ->
+            StringMap.add (field key_name string v) (field value_name f v) m
+        | _ -> assert false)
+      StringMap.empty x
+
+  let union x = match x with [ `Elt (k, v) ] -> (k, v) | _ -> assert false
   let unit _ = ()
 end
 
