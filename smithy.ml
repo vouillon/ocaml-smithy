@@ -17,6 +17,7 @@ Things to consider
 - endpoint configuration
 - streaming
 - pagination ==> modification of the request / access to the response
+- waiters
 - retries ==> retryable errors / idempotency
 - presigned URLs
 
@@ -27,6 +28,17 @@ Compiling an operation:
 To_XML ==> xmlNamespace / xmlAttribute
 
 type 'a error = {code : int; name : string; body: string; value : 'a }
+
+
+
+context :
+==> Lwt/async
+==> retry policy
+==> endpoint configuration
+==> pagination
+
+('a, 'a Lwt) context
+
 *)
 
 open Yojson.Safe
@@ -247,6 +259,7 @@ let reserved_words =
     "type";
     "bool";
     "float";
+    "int";
     "option";
     "string";
     "unit";
@@ -269,7 +282,7 @@ let type_name id =
       match id.identifier with
       | "Boolean" | "PrimitiveBoolean" -> "bool"
       | "Blob" | "String" -> "string"
-      | "Integer" -> "Int32.t"
+      | "Integer" -> "int"
       | "Long" | "PrimitiveLong" -> "Int64.t"
       | "Float" | "Double" -> "float"
       | "Timestamp" -> "CalendarLib.Calendar.t"
@@ -511,7 +524,7 @@ let default_value shapes typ default =
       Exp.constant
         (match type_of_shape shapes typ with
         | Float | Double -> Const.float (Printf.sprintf "%d." n)
-        | Integer -> Const.int32 (Int32.of_int n)
+        | Integer -> Const.int n
         | Long -> Const.int64 (Int64.of_int n)
         | _ -> assert false)
   | `Bool b -> if b then [%expr true] else [%expr false]
@@ -614,7 +627,7 @@ let print_type ?heading ~inputs ~shapes (nm, (sh, traits)) =
           l
       in
       Type.mk ?docs ~kind:(Ptype_variant l) (Location.mknoloc (type_name nm))
-  | Integer -> manifest_type [%type: Int32.t]
+  | Integer -> manifest_type [%type: int]
   | Long -> manifest_type [%type: Int64.t]
   | Float | Double -> manifest_type [%type: float]
   | Timestamp -> manifest_type [%type: CalendarLib.Calendar.t]
@@ -1581,6 +1594,312 @@ let compile_operations ~service_info ~protocol ~shapes =
   in
   compile shs @ List.concat (List.rev ops)
 
+type expr =
+  | Bool of bool
+  | String of string
+  | Int of int
+  | Apply of { f : string; args : expr list; assign : string option }
+  | Var of string
+
+type rule = { conditions : expr list; desc : rule_desc }
+
+and rule_desc =
+  | Tree of rule list
+  | Error of string
+  | Endpoint of {
+      url : expr;
+      auth_schemes : auth_schemes list option;
+      headers : (string * string) list;
+    }
+
+and auth_schemes = {
+  name : string;
+  signing_region : string option;
+  signing_region_set : string list option;
+  signing_name : string;
+  disable_double_encoding : bool option;
+}
+
+let to_caml_list l =
+  List.fold_right (fun e rem -> [%expr [%e e] :: [%e rem]]) l [%expr []]
+
+let tag_re =
+  Re.(
+    compile
+      (seq
+         [
+           char '{';
+           group (rep1 (diff any (set "#}")));
+           opt (seq [ char '#'; group (rep1 (diff any (set "}"))) ]);
+           char '}';
+         ]))
+
+let compile_string s =
+  match Re.split_full tag_re s with
+  | [ `Text s ] -> Exp.constant (Const.string s)
+  | l ->
+      let l =
+        List.map
+          (fun x ->
+            match x with
+            | `Text s -> Exp.constant (Const.string s)
+            | `Delim g -> (
+                let t = uncapitalized_identifier (Re.Group.get g 1) in
+                let t =
+                  if t = "endpoint" then [%expr Uri.to_string [%e ident t]]
+                  else ident t
+                in
+                match Re.Group.get_opt g 2 with
+                | None -> t
+                | Some f ->
+                    Exp.field t
+                      (Location.mknoloc
+                         Longident.(
+                           Ldot
+                             ( Ldot (Lident "Converters", "Endpoint"),
+                               uncapitalized_identifier f )))))
+          l
+      in
+
+      [%expr String.concat "" [%e to_caml_list l]]
+
+let array_access_re =
+  Re.(
+    compile
+      (whole_string
+         (seq [ group (rep any); char '['; group (rep any); char ']' ])))
+
+let rec compile_expr e =
+  match e with
+  | Bool b -> if b then [%expr true] else [%expr false]
+  | String s -> compile_string s
+  | Int i -> Exp.constant (Const.int i)
+  | Var nm -> ident (uncapitalized_identifier nm)
+  | Apply { f; args; _ } -> (
+      let fn f =
+        Exp.ident
+          (Location.mknoloc
+             Longident.(Ldot (Ldot (Lident "Converters", "Endpoint"), f)))
+      in
+      match (f, args) with
+      | "aws.isVirtualHostableS3Bucket", [ b; b' ] ->
+          [%expr
+            [%e fn "is_virtual_hostable_s3_bucket"]
+              [%e compile_expr b] [%e compile_expr b']]
+      | "aws.parseArn", [ b ] -> [%expr [%e fn "parse_arn"] [%e compile_expr b]]
+      | "aws.partition", [ r ] ->
+          [%expr [%e fn "partition"] [%e compile_expr r]]
+      | "booleanEquals", [ e; Bool true ] -> compile_expr e
+      | "booleanEquals", [ e; Bool false ] -> [%expr not [%e compile_expr e]]
+      | "booleanEquals", [ e; e' ] ->
+          [%expr [%e compile_expr e] = [%e compile_expr e']]
+      | "getAttr", [ r; String s ] -> (
+          match Re.exec_opt array_access_re s with
+          | Some g ->
+              [%expr
+                [%e fn "array_get_opt"]
+                  [%e
+                    Exp.field (compile_expr r)
+                      (Location.mknoloc
+                         Longident.(
+                           Ldot
+                             ( Ldot (Lident "Converters", "Endpoint"),
+                               uncapitalized_identifier (Re.Group.get g 1) )))]
+                  [%e
+                    Exp.constant (Const.int (int_of_string (Re.Group.get g 2)))]]
+          | None ->
+              Exp.field (compile_expr r)
+                (Location.mknoloc
+                   Longident.(
+                     Ldot
+                       ( Ldot (Lident "Converters", "Endpoint"),
+                         uncapitalized_identifier s ))))
+      | "isSet", [ e ] -> [%expr [%e compile_expr e] <> None]
+      | "isValidHostLabel", [ e; e' ] ->
+          [%expr
+            [%e fn "is_valid_host_label"] [%e compile_expr e]
+              [%e compile_expr e']]
+      | "not", [ Apply { f = "isSet"; args = [ e ]; _ } ] ->
+          [%expr [%e compile_expr e] = None]
+      | "not", [ e ] -> [%expr not [%e compile_expr e]]
+      | "parseURL", [ e ] -> [%expr [%e fn "parse_url"] [%e compile_expr e]]
+      | "stringEquals", [ e; e' ] ->
+          [%expr [%e compile_expr e] = [%e compile_expr e']]
+      | "substring", [ s; i; j; rev ] ->
+          [%expr
+            [%e fn "substring"] [%e compile_expr s] [%e compile_expr i]
+              [%e compile_expr j] [%e compile_expr rev]]
+      | "uriEncode", [ e ] -> [%expr (*Uri.to_string*) Some [%e compile_expr e]]
+      | _ ->
+          Format.eprintf "%s@." f;
+          assert false)
+
+let rec compile_rule rule =
+  let body =
+    match rule.desc with
+    | Tree l -> compile_rule_list l
+    | Error s -> [%expr Some (Result.error [%e compile_string s])]
+    | Endpoint { url; headers; _ } ->
+        [%expr
+          Some
+            (Result.ok
+               ( [%e
+                   match url with
+                   | Var "Endpoint" -> [%expr Uri.to_string endpoint]
+                   | _ -> compile_expr url],
+                 [%e
+                   to_caml_list
+                     (List.map
+                        (fun (k, v) ->
+                          [%expr
+                            [%e Exp.constant (Const.string k)],
+                              [%e compile_string v]])
+                        headers)] ))]
+    (*ZZZ*)
+  in
+  List.fold_right
+    (fun expr rem ->
+      let e = compile_expr expr in
+      match expr with
+      | Apply { assign = Some x; _ } ->
+          [%expr
+            let* [%p Pat.var (Location.mknoloc (uncapitalized_identifier x))] =
+              [%e e]
+            in
+            [%e rem]]
+      | Apply { f = "isSet"; args = [ Var x ]; _ } ->
+          let x = uncapitalized_identifier x in
+          [%expr
+            let* [%p Pat.var (Location.mknoloc x)] = [%e ident x] in
+            [%e rem]]
+      | Apply { f = "aws.parseArn"; _ } ->
+          [%expr
+            let* _ = [%e e] in
+            [%e rem]]
+      | _ ->
+          [%expr
+            let* () = check [%e e] in
+            [%e rem]])
+    rule.conditions body
+
+and compile_rule_list rules =
+  match rules with
+  | [ rule ] -> compile_rule rule
+  | _ ->
+      [%expr
+        seq
+          [%e
+            List.fold_right
+              (fun rule rem ->
+                [%expr (fun () -> [%e compile_rule rule]) :: [%e rem]])
+              rules [%expr []]]]
+
+let handle_endpoint ruleset =
+  let rec expr c =
+    match c with
+    | `Bool _ -> Bool Util.(to_bool c)
+    | `String _ -> String Util.(to_string c)
+    | `Int _ -> Int Util.(to_int c)
+    | `Assoc _ ->
+        if Util.member "fn" c <> `Null then
+          let f = Util.(c |> member "fn" |> to_string) in
+          (*
+      2 aws.isVirtualHostableS3Bucket
+        ====> packages/util-endpoints/src/lib/aws/isVirtualHostableS3Bucket.ts
+      7 aws.parseArn
+    356 aws.partition
+        ====> packages/util-endpoints/src/lib/aws/partition.ts
+   3978 booleanEquals
+   1624 getAttr
+    518 isSet
+     31 isValidHostLabel
+    167 not
+    279 parseURL
+    426 stringEquals
+      5 substring
+      2 uriEncode
+*)
+          let args = Util.(c |> member "argv" |> to_list |> List.map expr) in
+          let assign = Util.(c |> member "assign" |> to_option to_string) in
+          Apply { f; args; assign }
+        else if Util.member "ref" c <> `Null then (
+          assert (Util.member "assert" c = `Null);
+          Var Util.(c |> member "ref" |> to_string))
+        else assert false
+    | _ -> assert false
+  in
+  let auth_schemes s =
+    {
+      name = Util.(s |> member "name" |> to_string);
+      signing_region = Util.(s |> member "signingRegion" |> to_option to_string);
+      signing_region_set =
+        Util.(
+          s |> member "signingRegionSet" |> to_option to_list
+          |> Option.map (List.map to_string));
+      signing_name = Util.(s |> member "signingName" |> to_string);
+      disable_double_encoding =
+        Util.(s |> member "disableDoubleEncoding" |> to_option to_bool);
+    }
+  in
+  let rec rule_list r = List.map rule Util.(r |> member "rules" |> to_list)
+  and rule r =
+    let typ = Util.(r |> member "type" |> to_string) in
+    {
+      conditions = Util.(r |> member "conditions" |> to_list |> List.map expr);
+      desc =
+        (match typ with
+        | "tree" -> Tree (rule_list r)
+        | "endpoint" ->
+            let e = Util.(r |> member "endpoint") in
+            prerr_endline (to_string e);
+            Endpoint
+              {
+                url = Util.(e |> member "url" |> expr);
+                headers =
+                  Util.(
+                    e |> member "headers" |> to_assoc
+                    |> List.map (fun (nm, value) ->
+                           ( nm,
+                             value |> to_list |> fun l ->
+                             match l with
+                             | [ s ] -> to_string s
+                             | _ -> assert false )));
+                auth_schemes =
+                  Util.(
+                    e |> member "properties" |> member "authSchemes"
+                    |> to_option to_list
+                    |> Option.map (List.map auth_schemes));
+              }
+        | "error" -> Error Util.(r |> member "error" |> to_string)
+        | _ -> assert false);
+    }
+  in
+  let parameters =
+    Util.(
+      ruleset |> member "parameters" |> to_assoc
+      |> List.map (fun (nm, info) ->
+             ( nm,
+               info |> member "required" |> to_bool,
+               info |> member "default" |> to_option to_bool )))
+  in
+  let rules = rule_list ruleset in
+  List.fold_right
+    (fun (p, required, default) rem ->
+      let p = uncapitalized_identifier p in
+      Exp.fun_
+        (if p = "region" || (required && default = None) then Labelled p
+        else Optional p)
+        (Option.map
+           (fun b -> if b then [%expr true] else [%expr false])
+           default)
+        (Pat.var (Location.mknoloc p))
+        rem)
+    parameters
+    [%expr
+      fun () ->
+        let open Converters.Endpoint.Rules in
+        [%e compile_rule_list rules]]
+
 let protocols =
   [
     ("aws.protocols#awsJson1_0", `AwsJson1_1);
@@ -1642,6 +1961,17 @@ let compile dir f =
   let service_info =
     match service with _, (Service info, _) -> info | _ -> assert false
   in
+  let endpoint =
+    [
+      Str.value Nonrecursive
+        [
+          Vb.mk
+            (Pat.var (Location.mknoloc "endpoint"))
+            (handle_endpoint
+               (List.assoc "smithy.rules#endpointRuleSet" (snd (snd service))));
+        ];
+    ]
+  in
   let operations =
     match protocol with
     | (`AwsJson1_1 | `AwsJson1_0) as protocol ->
@@ -1649,9 +1979,12 @@ let compile dir f =
     | _ -> []
   in
   Format.fprintf f "%a@." Pprintast.structure
-    (toplevel_doc
+    (toplevel_doc @ endpoint
     @ Str.text [ Docstrings.docstring "{1 Type definitions}" loc ]
-    @ (types :: Str.text [ Docstrings.docstring "{1 Record constructors}" loc ])
+    @ types
+      ::
+      (if record_constructors = [] then []
+      else Str.text [ Docstrings.docstring "{1 Record constructors}" loc ])
     @ record_constructors
     @ Str.text [ Docstrings.docstring "/*" loc ]
     @ converters @ converters'

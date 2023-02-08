@@ -20,7 +20,7 @@ module To_JSON = struct
   let boolean x = `Bool x
   let blob x = `String (Base64.encode_string x)
   let string x = `String x
-  let integer x = `Intlit (Int32.to_string x)
+  let integer x = `Intlit (Int.to_string x)
   let long x = `Intlit (Int64.to_string x)
 
   let float x =
@@ -45,8 +45,8 @@ module From_JSON = struct
 
   let integer x =
     match x with
-    | `Int x -> Int32.of_int x
-    | `Intlit x -> Int32.of_string x
+    | `Int x -> x
+    | `Intlit x -> int_of_string x
     | _ -> assert false
 
   let long x =
@@ -157,7 +157,7 @@ module To_XML = struct
   let boolean x = [ `Data (if x then "true" else "false") ]
   let blob x = [ `Data (Base64.encode_string x) ]
   let string x = [ `Data x ]
-  let integer x = [ `Data (Int32.to_string x) ]
+  let integer x = [ `Data (Int.to_string x) ]
   let long x = [ `Data (Int64.to_string x) ]
 
   let float x =
@@ -198,7 +198,7 @@ module From_XML = struct
     match string x with "true" -> true | "false" -> false | _ -> assert false
 
   let blob x = Base64.decode_exn (string x)
-  let integer x = Int32.of_string (string x)
+  let integer x = int_of_string (string x)
   let long x = Int64.of_string (string x)
 
   let float x =
@@ -268,7 +268,7 @@ module To_Graph = struct
   let boolean x = [ `Data (if x then "true" else "false") ]
   let blob x = [ `Data (Base64.encode_string x) ]
   let string x = [ `Data x ]
-  let integer x = [ `Data (Int32.to_string x) ]
+  let integer x = [ `Data (Int.to_string x) ]
   let long x = [ `Data (Int64.to_string x) ]
 
   let float x =
@@ -300,6 +300,250 @@ module To_Graph = struct
     in
     if flat then values else [ `Elt (name, values) ]
 
-  let field name f x = [ `Elt ("name", f x) ]
+  let field name f x = [ `Elt (name, f x) ]
   let structure l = List.concat l
+end
+
+module Endpoint = struct
+  type region_info = {
+    supports_fips : bool;
+    supports_dual_stack : bool;
+    name : string;
+    dns_suffix : string;
+    dual_stack_dns_suffix : string;
+  }
+
+  let partitions =
+    let region_suffix_re =
+      Re.(
+        seq
+          [
+            char '-';
+            rep1 (alt [ rg 'a' 'z'; rg 'A' 'Z'; rg '0' '9' ]);
+            char '-';
+            rep1 (rg '0' '9');
+          ])
+    in
+    [
+      ( {
+          dns_suffix = "amazonaws.com";
+          dual_stack_dns_suffix = "api.aws";
+          name = "aws";
+          supports_dual_stack = true;
+          supports_fips = true;
+        },
+        Re.(
+          compile
+            (whole_string
+               (seq
+                  [
+                    alt
+                      (List.map str
+                         [ "us"; "eu"; "ap"; "sa"; "ca"; "me"; "af" ]);
+                    region_suffix_re;
+                  ]))),
+        [
+          "af-south-1";
+          "ap-east-1";
+          "ap-northeast-1";
+          "ap-northeast-2";
+          "ap-northeast-3";
+          "ap-south-1";
+          "ap-south-2";
+          "ap-southeast-1";
+          "ap-southeast-2";
+          "ap-southeast-3";
+          "ap-southeast-4";
+          "aws-global";
+          "ca-central-1";
+          "eu-central-1";
+          "eu-central-2";
+          "eu-north-1";
+          "eu-south-1";
+          "eu-south-2";
+          "eu-west-1";
+          "eu-west-2";
+          "eu-west-3";
+          "me-central-1";
+          "me-south-1";
+          "sa-east-1";
+          "us-east-1";
+          "us-east-2";
+          "us-west-1";
+          "us-west-2";
+        ] );
+      ( {
+          dns_suffix = "amazonaws.com.cn";
+          dual_stack_dns_suffix = "api.amazonwebservices.com.cn";
+          name = "aws-cn";
+          supports_dual_stack = true;
+          supports_fips = true;
+        },
+        Re.(
+          compile
+            (whole_string
+               (seq
+                  [
+                    str "cn-";
+                    rep1 (alt [ rg 'a' 'z'; rg 'A' 'Z'; rg '0' '9' ]);
+                    char '-';
+                    rep1 (rg '0' '9');
+                  ]))),
+        [ "aws-cn-global"; "cn-north-1"; "cn-northwest-1" ] );
+      ( {
+          dns_suffix = "amazonaws.com";
+          dual_stack_dns_suffix = "api.aws";
+          name = "aws-us-gov";
+          supports_dual_stack = true;
+          supports_fips = true;
+        },
+        Re.(compile (whole_string (seq [ str "us-gov"; region_suffix_re ]))),
+        [ "aws-us-gov-global"; "us-gov-east-1"; "us-gov-west-1" ] );
+      ( {
+          dns_suffix = "c2s.ic.gov";
+          dual_stack_dns_suffix = "c2s.ic.gov";
+          name = "aws-iso";
+          supports_dual_stack = false;
+          supports_fips = true;
+        },
+        Re.(compile (whole_string (seq [ str "us-iso"; region_suffix_re ]))),
+        [ "aws-iso-global"; "us-iso-east-1"; "us-iso-west-1" ] );
+      ( {
+          dns_suffix = "sc2s.sgov.gov";
+          dual_stack_dns_suffix = "sc2s.sgov.gov";
+          name = "aws-iso-b";
+          supports_dual_stack = false;
+          supports_fips = true;
+        },
+        Re.(compile (whole_string (seq [ str "us-isob"; region_suffix_re ]))),
+        [ "aws-iso-b-global"; "us-isob-east-1" ] );
+    ]
+
+  let partition r : region_info option =
+    let output, _, _ =
+      try List.find (fun (_, _, lst) -> List.mem r lst) partitions
+      with Not_found -> (
+        try List.find (fun (_, re, _) -> Re.execp re r) partitions
+        with Not_found ->
+          List.find (fun (output, _, _) -> output.name = "aws") partitions)
+    in
+    Some output
+
+  let valid_host_label_re =
+    Re.(
+      let alphanum = alt [ rg 'a' 'z'; rg 'A' 'Z'; rg '0' '9' ] in
+      compile
+        (whole_string
+           (seq [ repn (alt [ alphanum; char '-' ]) 0 (Some 62); alphanum ])))
+
+  let rec is_valid_host_label x allow_subdomains =
+    if not allow_subdomains then Re.execp valid_host_label_re x
+    else
+      List.for_all
+        (fun x -> is_valid_host_label x false)
+        (String.split_on_char '.' x)
+
+  type arn = {
+    partition : string;
+    service : string;
+    region : string;
+    account_id : string;
+    resource_id : string array;
+  }
+
+  let parse_arn arn =
+    let segments = String.split_on_char ':' arn in
+    match segments with
+    | "arn" :: partition :: service :: region :: account_id
+      :: (r :: _ as resource_id) ->
+        if partition = "" || service = "" || r = "" then None
+        else
+          Some
+            {
+              partition;
+              service;
+              region;
+              account_id;
+              resource_id = Array.of_list resource_id;
+            }
+    | _ -> None
+
+  let rec is_virtual_hostable_s3_bucket x allow_subdomains =
+    if allow_subdomains then
+      List.for_all
+        (fun x -> is_virtual_hostable_s3_bucket x false)
+        (String.split_on_char '.' x)
+    else
+      is_valid_host_label x false
+      && String.length x >= 3
+      && x = String.lowercase_ascii x
+
+  type url = {
+    scheme : string;
+    is_ip : bool;
+    authority : string;
+    path : string;
+    normalized_path : string;
+  }
+
+  let ip_address_re =
+    let open Re in
+    let digit = rg '0' '9' in
+    let byte =
+      alt
+        [
+          seq [ char '2'; char '5'; rg '0' '5' ];
+          seq [ char '2'; rg '0' '4'; digit ];
+          seq [ char '1'; digit; digit ];
+          seq [ rg '1' '9'; digit ];
+          digit;
+        ]
+    in
+    Re.compile
+      (whole_string
+         (alt
+            [
+              seq [ byte; char '.'; byte; char '.'; byte; char '.'; byte ];
+              seq [ char '['; rep any; char ']' ];
+            ]))
+
+  let is_ip_address s = Re.execp ip_address_re s
+
+  let parse_url uri : url option =
+    Option.bind (Uri.scheme uri) @@ fun scheme ->
+    Option.bind (Uri.host uri) @@ fun host ->
+    let path = Uri.path uri in
+    let authority =
+      match Uri.port uri with
+      | Some port -> host ^ ":" ^ string_of_int port
+      | None -> host
+    in
+    Some
+      {
+        scheme;
+        is_ip = is_ip_address host;
+        authority;
+        path;
+        normalized_path =
+          (if String.ends_with ~suffix:"/" path then path else path ^ "/");
+      }
+
+  let array_get_opt a i = if i >= Array.length a then None else Some a.(i)
+
+  let substring s i j rev =
+    let l = String.length s in
+    if j > l then None
+    else
+      Some
+        (if rev then String.sub s (l - j) (j - i) else String.sub s i (j - i))
+
+  module Rules = struct
+    let ( let* ) = Option.bind
+    let check b = if b then Some () else None
+
+    let rec seq l =
+      match l with
+      | [] -> assert false
+      | f :: rem -> ( match f () with Some x -> Some x | None -> seq rem)
+  end
 end
