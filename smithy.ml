@@ -1,13 +1,9 @@
 (*
 - mli files
 
-- serializer / deserializer      Json / XML
-
 - timestampFormat
 
 - validation: length, pattern, range, uniqueItems  (put that in the documentation?)
-
-- documentation
 
       4 aws.protocols#restXml     <== S3
      17 aws.protocols#awsQuery
@@ -16,9 +12,6 @@
     186 aws.protocols#restJson1
 
 ./gradlew :smithy-aws-protocol-tests:build
-
-- doc:
-  - also search references in field of input / output ==> {!type-t.field}
 
 Things to consider
 - endpoint configuration
@@ -37,6 +30,12 @@ type 'a error = {code : int; name : string; body: string; value : 'a }
 *)
 
 open Yojson.Safe
+
+module StringMap = Map.Make (struct
+  type t = string
+
+  let compare = compare
+end)
 
 type shape_id = { namespace : string; identifier : string }
 
@@ -77,7 +76,7 @@ type shape =
   | Structure of (string * shape_id * traits) list
   | Union of (string * shape_id * traits) list
   | Service of service
-  | Resource
+  | Resource of resource
   | Operation of operation
 
 and service = {
@@ -85,6 +84,18 @@ and service = {
   operations : shape_id list;
   resources : shape_id list;
   errors : shape_id list;
+}
+
+and resource = {
+  create : shape_id option;
+  put : shape_id option;
+  read : shape_id option;
+  update : shape_id option;
+  delete : shape_id option;
+  list : shape_id option;
+  operations : shape_id list;
+  collection_operations : shape_id list;
+  resources : shape_id list;
 }
 
 and operation = { input : shape_id; output : shape_id; errors : shape_id list }
@@ -157,7 +168,25 @@ let parse_shape (id, sh) =
               resources = parse_list "resources";
               errors = parse_list "errors";
             }
-      | "resource" -> Resource
+      | "resource" ->
+          let parse_member_opt name =
+            Util.(
+              sh |> member name
+              |> to_option (fun t ->
+                     t |> member "target" |> to_string |> parse_shape_id))
+          in
+          Resource
+            {
+              create = parse_member_opt "create";
+              put = parse_member_opt "put";
+              read = parse_member_opt "read";
+              update = parse_member_opt "update";
+              delete = parse_member_opt "delete";
+              list = parse_member_opt "list";
+              operations = parse_list "operations";
+              collection_operations = parse_list "collectionOperations";
+              resources = parse_list " resources";
+            }
       | "operation" ->
           Operation
             {
@@ -352,79 +381,101 @@ let rec format_dl ~format l dts (dds : _ list) =
       format_dl ~format rem dts dds
   | [] -> if dts <> [] then format_group () else ""
 
-let rec format ~shapes ~in_anchor ?(in_list = false) ~toplevel doc =
+let rec format ~shapes ~field_refs ~in_anchor ?(in_list = false) ~toplevel doc =
   match doc with
   | Text txt -> escape_text txt
   | Element ("p", _, children) ->
-      let s = format_children ~shapes ~in_anchor ~toplevel:false children in
+      let s =
+        format_children ~shapes ~field_refs ~in_anchor ~toplevel:false children
+      in
       if toplevel then s ^ "\n\n" else s
-  | Element ("code", _, children) | Element ("a", [], children) ->
+  | Element ("code", _, children) | Element ("a", [], children) -> (
       let s = escape_code (children_text children) in
       let reference =
-        IdMap.filter (fun { identifier; _ } _ -> identifier = s) shapes
+        match StringMap.find_opt s field_refs with
+        | Some typ ->
+            Some
+              (Printf.sprintf "{!type-%s.%s}"
+                 (uncapitalized_identifier typ)
+                 (uncapitalized_identifier s))
+        | None -> (
+            match
+              IdMap.choose_opt
+                (IdMap.filter
+                   (fun { identifier; _ } _ -> identifier = s)
+                   shapes)
+            with
+            | Some (_, (typ, _)) -> (
+                match typ with
+                | Service _ | Resource _ -> Some ("[" ^ s ^ "]")
+                | Operation _ ->
+                    Some ("[" ^ s ^ "]")
+                    (*ZZZZ "{!val:" ^ uncapitalized_identifier s ^ "}" *)
+                | _ -> Some ("{!type:" ^ uncapitalized_identifier s ^ "}"))
+            | None -> None)
       in
-      if not (in_anchor || IdMap.is_empty reference) then
-        let _, (typ, _) = IdMap.choose reference in
-        match typ with
-        | Service _ | Resource -> "[" ^ s ^ "]"
-        | Operation _ ->
-            "[" ^ s ^ "]" (*ZZZZ "{!val:" ^ uncapitalized_identifier s ^ "}" *)
-        | _ -> "{!type:" ^ uncapitalized_identifier s ^ "}"
-      else "[" ^ s ^ "]"
+      match reference with
+      | Some reference when not in_anchor -> reference
+      | _ -> "[" ^ s ^ "]")
   | Element (("i" | "replaceable" | "title"), _, children) ->
-      let s = format_children ~shapes ~in_anchor ~toplevel:false children in
+      let s =
+        format_children ~shapes ~field_refs ~in_anchor ~toplevel:false children
+      in
       if empty_text s then s else "{i " ^ s ^ "}"
   | Element ("b", _, children) ->
-      let s = format_children ~shapes ~in_anchor ~toplevel:false children in
+      let s =
+        format_children ~shapes ~field_refs ~in_anchor ~toplevel:false children
+      in
       if empty_text s then s else "{b " ^ s ^ "}"
   | Element (("note" | "para"), _, children) ->
-      format_children ~shapes ~in_anchor ~toplevel children
+      format_children ~shapes ~field_refs ~in_anchor ~toplevel children
   | Element ("important", _, children) ->
-      format_children ~shapes ~in_anchor ~toplevel children
+      format_children ~shapes ~field_refs ~in_anchor ~toplevel children
   | Element ("a", attr, children) when List.mem_assoc "href" attr ->
       let url = List.assoc "href" attr in
-      let s = format_children ~shapes ~in_anchor:true ~toplevel children in
+      let s =
+        format_children ~shapes ~field_refs ~in_anchor:true ~toplevel children
+      in
       if empty_text url then s else "{{: " ^ url ^ " }" ^ s ^ "}"
   | Element ("ul", _, children) ->
       "\n{ul "
-      ^ format_children ~shapes ~in_anchor ~in_list:true ~toplevel:false
-          (fix_list children)
+      ^ format_children ~shapes ~field_refs ~in_anchor ~in_list:true
+          ~toplevel:false (fix_list children)
       ^ "}\n"
   | Element ("li", _, children) ->
-      let s = format_children ~shapes ~in_anchor ~toplevel:false children in
+      let s =
+        format_children ~shapes ~field_refs ~in_anchor ~toplevel:false children
+      in
       if in_list then "{- " ^ s ^ "}" else s
   | Element ("dl", _, children) ->
       "\n{ul "
       ^ format_dl
-          ~format:(format_children ~shapes ~in_anchor ~toplevel:false)
+          ~format:
+            (format_children ~shapes ~field_refs ~in_anchor ~toplevel:false)
           children [] []
       ^ "}\n"
-  (*
-  | Element ("dt", _, children) ->
-      let s = format_children ~shapes ~in_anchor ~toplevel:false children in
-      if empty_text s then "{- " else "{- {b " ^ s ^ "} "
-  | Element ("dd", _, children) ->
-      format_children ~shapes ~in_anchor ~toplevel:false children ^ "}"
-*)
   | Element ("ol", _, children) ->
       "\n{ol "
-      ^ format_children ~shapes ~in_anchor ~in_list:true ~toplevel:false
-          (fix_list children)
+      ^ format_children ~shapes ~field_refs ~in_anchor ~in_list:true
+          ~toplevel:false (fix_list children)
       ^ "}\n"
   | Element ("br", _, []) -> "\n\n"
   | Element ("fullname", _, _) -> ""
   | Element (nm, _, children) ->
       let s =
         "<" ^ nm ^ ">"
-        ^ format_children ~shapes ~in_anchor ~toplevel:false children
+        ^ format_children ~shapes ~field_refs ~in_anchor ~toplevel:false
+            children
       in
       (*      Format.eprintf "AAA %s@." s;*)
       s
 
-and format_children ~shapes ~in_anchor ?(in_list = false) ~toplevel lst =
-  String.concat "" (List.map (format ~shapes ~in_anchor ~in_list ~toplevel) lst)
+and format_children ~shapes ~field_refs ~in_anchor ?(in_list = false) ~toplevel
+    lst =
+  String.concat ""
+    (List.map (format ~shapes ~field_refs ~in_anchor ~in_list ~toplevel) lst)
 
-let documentation ~shapes doc =
+let documentation ~shapes ~field_refs doc =
   let open Markup in
   if doc = "" then None
   else
@@ -439,15 +490,17 @@ let documentation ~shapes doc =
     |> fun doc' ->
     match doc' with
     | Some (Element ("body", _, children)) ->
-        Some (format_children ~shapes ~in_anchor:false ~toplevel:true children)
+        Some
+          (format_children ~shapes ~field_refs ~in_anchor:false ~toplevel:true
+             children)
     | _ -> assert false
 
-let documentation ~shapes traits =
+let documentation ~shapes ?(field_refs = StringMap.empty) traits =
   match List.assoc_opt "smithy.api#documentation" traits with
   | None -> None
   | Some doc -> (
       let doc = Yojson.Safe.Util.to_string doc in
-      match documentation ~shapes doc with
+      match documentation ~shapes ~field_refs doc with
       | Some doc -> Some (Docstrings.docstring doc loc)
       | None -> None)
 
@@ -605,7 +658,7 @@ let print_type ?heading ~inputs ~shapes (nm, (sh, traits)) =
           l
       in
       Type.mk ?docs ~kind:(Ptype_variant l) (Location.mknoloc (type_name nm))
-  | Service _ | Resource | Operation _ -> assert false
+  | Service _ | Resource _ | Operation _ -> assert false
 
 let print_types ~inputs ~operations shapes =
   let types =
@@ -613,7 +666,7 @@ let print_types ~inputs ~operations shapes =
       (IdMap.filter
          (fun _ (typ, _) ->
            match typ with
-           | Service _ | Operation _ | Resource -> false
+           | Service _ | Operation _ | Resource _ -> false
            | _ -> true)
          shapes)
   in
@@ -759,7 +812,7 @@ let to_json (name, (sh, traits)) =
                                    [%e (converter ~path ~sparse:false) typ] x])
                            l)];
                   ]]
-          | Service _ | Resource | Operation _ -> assert false)
+          | Service _ | Resource _ | Operation _ -> assert false)
           [%type: Yojson.Safe.t]))
 
 let print_to_json shs =
@@ -900,7 +953,7 @@ let to_xml (name, (sh, traits)) =
                                   (field_xml_converter ~param:"x" constr))
                               l)];
                      ]]
-             | Service _ | Resource | Operation _ -> assert false)
+             | Service _ | Resource _ | Operation _ -> assert false)
              [%type: Converters.To_XML.t])))
 
 let print_to_xml shs =
@@ -1058,7 +1111,7 @@ let to_graph ~protocol (name, (sh, traits)) =
                                      constr))
                               l)];
                      ]]
-             | Service _ | Resource | Operation _ -> assert false)
+             | Service _ | Resource _ | Operation _ -> assert false)
              [%type: Converters.To_Graph.t])))
 
 let print_to_graph ~protocol shs =
@@ -1150,7 +1203,7 @@ let from_json (name, (sh, traits)) =
                              [%expr [%e (converter ~path ~sparse:false) typ] x])))
                    l
                 @ [ Exp.case [%pat? _] [%expr assert false] ])
-          | Service _ | Resource | Operation _ -> assert false)
+          | Service _ | Resource _ | Operation _ -> assert false)
           (type_ident name)))
 
 let print_from_json shs =
@@ -1290,7 +1343,7 @@ let from_xml (name, (sh, traits)) =
                                   [%e (converter ~path ~sparse:false) typ] x])))
                       l
                    @ [ Exp.case [%pat? _] [%expr assert false] ])
-             | Service _ | Resource | Operation _ -> assert false)
+             | Service _ | Resource _ | Operation _ -> assert false)
              (type_ident name))))
 
 let print_from_xml shs =
@@ -1311,7 +1364,7 @@ let compute_inputs_outputs shapes =
           | Blob | Boolean | String | Enum _ | Integer | Long | Float | Double
           | Timestamp | Document ->
               set
-          | Service _ | Resource | Operation _ -> assert false
+          | Service _ | Resource _ | Operation _ -> assert false
           | List (id, _) | Map (_, (id, _)) -> traverse set ~direct:false id
           | Structure l | Union l ->
               List.fold_left
@@ -1361,8 +1414,19 @@ let compile_rest_operation ~shapes nm input output errors traits =
 ~builder:(fun k ~a ?(b =...) ~c -> k (To_Json.structure ...))
 ~errors:[("name", (retryable, fun x -> `Foo (From_Json.foo) x))); ...]
 *)
+
 let compile_operation ~service_info ~protocol ~shapes nm
     { input; output; errors } traits =
+  let field_refs name m =
+    if name.namespace = "smithy.api" then m
+    else
+      match IdMap.find name shapes with
+      | Structure l, _ ->
+          List.fold_left
+            (fun m (nm, _, _) -> StringMap.add nm name.identifier m)
+            m l
+      | _ -> assert false
+  in
   let docs =
     Some
       {
@@ -1374,7 +1438,11 @@ let compile_operation ~service_info ~protocol ~shapes nm
                  ("See type {!type:" ^ type_name input
                 ^ "} for a description of the parameters")
                  loc));
-        docs_post = documentation ~shapes traits;
+        docs_post =
+          documentation ~shapes
+            ~field_refs:
+              (StringMap.empty |> field_refs output |> field_refs input)
+            traits;
       }
   in
   (* Method: POST, uri: / *)
@@ -1467,15 +1535,51 @@ let compile_operation ~service_info ~protocol ~shapes nm
     ]
 
 let compile_operations ~service_info ~protocol ~shapes =
-  List.rev
-  @@ IdMap.fold
-       (fun nm (ty, traits) rem ->
-         match ty with
-         | Operation info ->
-             compile_operation ~service_info ~protocol ~shapes nm info traits
-             :: rem
-         | _ -> rem)
-       shapes []
+  let compile shs =
+    List.rev
+    @@ IdMap.fold
+         (fun nm (ty, traits) rem ->
+           match ty with
+           | Operation info ->
+               compile_operation ~service_info ~protocol ~shapes nm info traits
+               :: rem
+           | _ -> rem)
+         shs []
+  in
+  let shs, ops =
+    IdMap.fold
+      (fun nm (typ, traits) (shs, ops) ->
+        match typ with
+        | Resource r ->
+            let name =
+              nm.identifier |> to_snake_case
+              |> Re.replace_string Re.(compile (char '_')) ~by:" "
+              |> String.capitalize_ascii
+              |> fun s ->
+              if String.ends_with ~suffix:" resource" s then
+                String.sub s 0 (String.length s - 9)
+              else s
+            in
+            let add x l = match x with None -> l | Some x -> x :: l in
+            let operations =
+              r.operations @ r.collection_operations
+              |> add r.create |> add r.put |> add r.read |> add r.update
+              |> add r.delete |> add r.list
+            in
+            ( List.fold_left (fun shs x -> IdMap.remove x shs) shs operations,
+              (Str.text [ Docstrings.docstring ("{2 " ^ name ^ "}") loc ]
+              @ (match documentation ~shapes traits with
+                | None -> []
+                | Some doc -> Str.text [ doc ])
+              @ compile
+                  (List.fold_left
+                     (fun shs' id -> IdMap.add id (IdMap.find id shs) shs')
+                     IdMap.empty operations))
+              :: ops )
+        | _ -> (shs, ops))
+      shapes (shapes, [])
+  in
+  compile shs @ List.concat (List.rev ops)
 
 let protocols =
   [
@@ -1548,7 +1652,10 @@ let compile dir f =
     (toplevel_doc
     @ Str.text [ Docstrings.docstring "{1 Type definitions}" loc ]
     @ (types :: Str.text [ Docstrings.docstring "{1 Record constructors}" loc ])
-    @ record_constructors @ converters @ converters'
+    @ record_constructors
+    @ Str.text [ Docstrings.docstring "/*" loc ]
+    @ converters @ converters'
+    @ Str.text [ Docstrings.docstring "/*" loc ]
     @ Str.text [ Docstrings.docstring "{1 Operations}" loc ]
     @ operations);
   close_out ch
