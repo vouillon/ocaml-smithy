@@ -2001,17 +2001,16 @@ let compile dir f =
         compile_operations ~service_info ~protocol ~shapes:shs
     | _ -> []
   in
+  let toggle_hide = Str.text [ Docstrings.docstring "/*" loc ] in
   Format.fprintf f "%a@." Pprintast.structure
-    (toplevel_doc @ endpoint
+    (toplevel_doc
     @ Str.text [ Docstrings.docstring "{1 Type definitions}" loc ]
     @ types
       ::
       (if record_constructors = [] then []
       else Str.text [ Docstrings.docstring "{1 Record constructors}" loc ])
-    @ record_constructors
-    @ Str.text [ Docstrings.docstring "/*" loc ]
-    @ converters @ converters'
-    @ Str.text [ Docstrings.docstring "/*" loc ]
+    @ record_constructors @ toggle_hide @ endpoint @ converters @ converters'
+    @ toggle_hide
     @ Str.text [ Docstrings.docstring "{1 Operations}" loc ]
     @ operations);
   close_out ch
