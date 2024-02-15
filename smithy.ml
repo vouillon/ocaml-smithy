@@ -1,4 +1,8 @@
 (*
+TODO
+- generate operations for all protocols
+- sign and perform requests
+
 - mli files
 
 - timestampFormat
@@ -36,8 +40,6 @@ context :
 ==> retry policy
 ==> endpoint configuration
 ==> pagination
-
-('a, 'a Lwt) context
 
 *)
 
@@ -246,11 +248,13 @@ let reserved_words =
     "constraint";
     "else";
     "end";
+    "exception";
     "external";
     "function";
     "include";
     "match";
     "method";
+    "module";
     "mutable";
     "object";
     "or";
@@ -394,6 +398,15 @@ let rec format_dl ~format l dts (dds : _ list) =
       format_dl ~format rem dts dds
   | [] -> if dts <> [] then format_group () else ""
 
+let rec allowed_in_b l =
+  List.for_all
+    (fun item ->
+      match item with
+      | Element ("ul", _, _) -> false
+      | Element (_, _, children) -> allowed_in_b children
+      | Text _ -> true)
+    l
+
 let rec format ~shapes ~field_refs ~in_anchor ?(in_list = false) ~toplevel doc =
   match doc with
   | Text txt -> escape_text txt
@@ -439,7 +452,7 @@ let rec format ~shapes ~field_refs ~in_anchor ?(in_list = false) ~toplevel doc =
       let s =
         format_children ~shapes ~field_refs ~in_anchor ~toplevel:false children
       in
-      if empty_text s then s else "{b " ^ s ^ "}"
+      if empty_text s || not (allowed_in_b children) then s else "{b " ^ s ^ "}"
   | Element (("note" | "para"), _, children) ->
       format_children ~shapes ~field_refs ~in_anchor ~toplevel children
   | Element ("important", _, children) ->
@@ -517,9 +530,22 @@ let documentation ~shapes ?(field_refs = StringMap.empty) traits =
       | Some doc -> Some (Docstrings.docstring doc loc)
       | None -> None)
 
+let type_ident id =
+  Typ.constr (Location.mknoloc (Longident.Lident (type_name id))) []
+
 let default_value shapes typ default =
   match default with
-  | `String s -> Exp.constant (Const.string s)
+  | `String s -> (
+      match type_of_shape shapes typ with
+      | String -> Exp.constant (Const.string s)
+      | Enum _ ->
+          [%expr
+            ([%e
+               Exp.construct
+                 (Location.mknoloc (Longident.Lident (constr_name s)))
+                 None]
+              : [%t type_ident typ])]
+      | _ -> assert false)
   | `Int n ->
       Exp.constant
         (match type_of_shape shapes typ with
@@ -529,9 +555,6 @@ let default_value shapes typ default =
         | _ -> assert false)
   | `Bool b -> if b then [%expr true] else [%expr false]
   | _ -> assert false
-
-let type_ident id =
-  Typ.constr (Location.mknoloc (Longident.Lident (type_name id))) []
 
 let constructor_parameters ~shapes ~fields ~body =
   let has_optionals =
@@ -1689,7 +1712,7 @@ let rec compile_expr e =
       | "aws.parseArn", [ b ] -> [%expr [%e fn "parse_arn"] [%e compile_expr b]]
       | "aws.partition", [ r ] ->
           [%expr [%e fn "partition"] [%e compile_expr r]]
-      | "booleanEquals", [ e; Bool true ] -> compile_expr e
+      | "booleanEquals", ([ e; Bool true ] | [ Bool true; e ]) -> compile_expr e
       | "booleanEquals", [ e; Bool false ] -> [%expr not [%e compile_expr e]]
       | "booleanEquals", [ e; e' ] ->
           [%expr [%e compile_expr e] = [%e compile_expr e']]
@@ -1729,7 +1752,8 @@ let rec compile_expr e =
           [%expr
             [%e fn "substring"] [%e compile_expr s] [%e compile_expr i]
               [%e compile_expr j] [%e compile_expr rev]]
-      | "uriEncode", [ e ] -> [%expr (*Uri.to_string*) Some [%e compile_expr e]]
+      | "uriEncode", [ e ] ->
+          [%expr Some (Uri.pct_encode ~component:`Generic [%e compile_expr e])]
       | _ ->
           Format.eprintf "%s@." f;
           assert false)
@@ -1851,7 +1875,6 @@ let handle_endpoint ruleset =
         | "tree" -> Tree (rule_list r)
         | "endpoint" ->
             let e = Util.(r |> member "endpoint") in
-            prerr_endline (to_string e);
             Endpoint
               {
                 url = Util.(e |> member "url" |> expr);
@@ -1887,7 +1910,7 @@ let handle_endpoint ruleset =
     (fun (p, required, default) rem ->
       let p = uncapitalized_identifier p in
       Exp.fun_
-        (if p = "region" || (required && default = None) then Labelled p
+        (if (*p = "region" ||*) required && default = None then Labelled p
         else Optional p)
         (Option.map
            (fun b -> if b then [%expr true] else [%expr false])
@@ -1966,7 +1989,7 @@ let compile dir f =
       Str.value Nonrecursive
         [
           Vb.mk
-            (Pat.var (Location.mknoloc "endpoint"))
+            (Pat.var (Location.mknoloc "aws_endpoint"))
             (handle_endpoint
                (List.assoc "smithy.rules#endpointRuleSet" (snd (snd service))));
         ];
@@ -1995,10 +2018,18 @@ let compile dir f =
 
 let () =
   let _f { namespace = _; identifier = _ } = () in
-  let dir = "/home/jerome/aws-sdk-js-v3/codegen/sdk-codegen/aws-models" in
+  let dir = "/home/jerome/sources/aws-sdk-rust/aws-models" in
   if true then
-    let files = Sys.readdir dir in
-    Array.iter (fun f -> compile dir f) files
+    let files = Array.to_list (Sys.readdir dir) in
+    let files =
+      List.filter
+        (fun f ->
+          f <> "sdk-default-configuration.json"
+          && f <> "sdk-endpoints.json" && f <> "sdk-partitions.json"
+          && Filename.check_suffix f ".json")
+        files
+    in
+    List.iter (fun f -> compile dir f) files
   else
     let f = "s3.json" in
     compile dir f
