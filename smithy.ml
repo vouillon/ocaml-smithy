@@ -74,6 +74,14 @@ end)
 
 type traits = (string * Yojson.Safe.t) list
 
+type http_request_test = {
+  id : string;
+  documentation : string option;
+  method_ : string option;
+  uri : string;
+  params : Yojson.Safe.t;
+}
+
 type shape =
   | Blob (* string *)
   | Boolean
@@ -83,6 +91,9 @@ type shape =
   | Long (* int64 *)
   | Float
   | Double
+  | IntEnum
+  | Short
+  | Byte
   | Timestamp
   | Document
   | List of (shape_id * traits)
@@ -112,7 +123,25 @@ and resource = {
   resources : shape_id list;
 }
 
-and operation = { input : shape_id; output : shape_id; errors : shape_id list }
+and operation = {
+  input : shape_id;
+  output : shape_id;
+  errors : shape_id list;
+  http_request_tests : http_request_test list;
+}
+
+let unit_type = { namespace = "smithy.api"; identifier = "Unit" }
+
+let parse_http_request_test test =
+  let open Util in
+  prerr_endline (test |> member "id" |> to_string);
+  {
+    id = test |> member "id" |> to_string;
+    documentation = test |> member "documentation" |> to_option to_string;
+    method_ = test |> member "method" |> to_option to_string;
+    uri = test |> member "uri" |> to_string;
+    params = test |> member "params";
+  }
 
 let parse_shape (id, sh) =
   let typ = Util.(sh |> member "type" |> to_string) in
@@ -159,9 +188,7 @@ let parse_shape (id, sh) =
                      in
                      if String.contains value ' ' || String.contains value ':'
                      then raise Not_found;
-                     ( value,
-                       { namespace = "smithy.api"; identifier = "Unit" },
-                       [] )))
+                     (value, unit_type, [])))
           with Not_found -> String (* string *))
       | "enum" -> Enum (parse_members ())
       | "integer" -> Integer (* int32 *)
@@ -199,7 +226,7 @@ let parse_shape (id, sh) =
               list = parse_member_opt "list";
               operations = parse_list "operations";
               collection_operations = parse_list "collectionOperations";
-              resources = parse_list " resources";
+              resources = parse_list "resources";
             }
       | "operation" ->
           Operation
@@ -207,7 +234,17 @@ let parse_shape (id, sh) =
               input = fst (parse_member "input");
               output = fst (parse_member "output");
               errors = parse_list "errors";
+              http_request_tests =
+                Util.(
+                  traits
+                  |> List.assoc_opt "smithy.test#httpRequestTests"
+                  |> Option.value ~default:`Null
+                  |> to_option to_list |> Option.value ~default:[]
+                  |> List.map parse_http_request_test);
             }
+      | "intEnum" -> IntEnum
+      | "short" -> Short
+      | "byte" -> Byte
       | _ -> assert false),
       traits ) )
 
@@ -292,18 +329,19 @@ let type_name id =
       | "Timestamp" -> "CalendarLib.Calendar.t"
       | "Document" -> "Yojson.Safe.t"
       | "Unit" -> "unit"
-      | _ ->
-          prerr_endline id.identifier;
-          assert false)
+      | "Short" -> "int"
+      | "Byte" -> "char"
+      | _ -> assert false)
   | _ -> uncapitalized_identifier id.identifier
 
 let field_name = uncapitalized_identifier
 let constr_name = capitalized_identifier
 
 let optional_member (_, _, traits) =
-  not
-    (List.mem_assoc "smithy.api#required" traits
-    || List.mem_assoc "smithy.api#default" traits)
+  List.mem_assoc "smithy.api#clientOptional" traits
+  || not
+       (List.mem_assoc "smithy.api#required" traits
+       || List.mem_assoc "smithy.api#default" traits)
 
 let flattened_member (_, _, traits) =
   List.mem_assoc "smithy.api#xmlFlattened" traits
@@ -312,6 +350,14 @@ let type_of_shape shapes nm =
   if nm.namespace = "smithy.api" then (
     match nm.identifier with
     | "PrimitiveLong" -> Long
+    | "Integer" -> Integer
+    | "Long" -> Long
+    | "String" -> String
+    | "Float" -> Float
+    | "Double" -> Double
+    | "Boolean" -> Boolean
+    | "Blob" -> Blob
+    | "Timestamp" -> Timestamp
     | _ ->
         Format.eprintf "%s/%s@." nm.namespace nm.identifier;
         assert false)
@@ -591,6 +637,7 @@ let constructor_parameters ~shapes ~fields ~body =
     List.exists
       (fun (_, _, traits) ->
         List.mem_assoc "smithy.api#default" traits
+        || List.mem_assoc "smithy.api#clientOptional" traits
         || not (List.mem_assoc "smithy.api#required" traits))
       fields
   in
@@ -599,9 +646,15 @@ let constructor_parameters ~shapes ~fields ~body =
       let nm, typ, traits' = field in
       match List.assoc_opt "smithy.api#default" traits' with
       | Some default when default <> `Null ->
+          let default = default_value shapes typ default in
+          let default =
+            if List.mem_assoc "smithy.api#clientOptional" traits' then
+              [%expr Some [%e default]]
+            else default
+          in
           B.pexp_fun
             (Optional (field_name nm))
-            (Some (default_value shapes typ default))
+            (Some default)
             (B.ppat_var (Location.mknoloc (field_name nm)))
             expr
       | _ ->
@@ -686,9 +739,10 @@ let print_type ?heading ~inputs ~shapes (nm, (sh, traits)) =
         B.type_declaration ~manifest:None ~kind:(Ptype_variant l)
           ~name:(Location.mknoloc (type_name nm))
           ~params:[] ~cstrs:[] ~private_:Public
-    | Integer -> manifest_type [%type: int]
+    | Integer | IntEnum | Short -> manifest_type [%type: int]
     | Long -> manifest_type [%type: Int64.t]
     | Float | Double -> manifest_type [%type: float]
+    | Byte -> manifest_type [%type: char]
     | Timestamp -> manifest_type [%type: CalendarLib.Calendar.t]
     | Document -> manifest_type [%type: Yojson.Safe.t]
     | List (id, _) ->
@@ -727,10 +781,8 @@ let print_type ?heading ~inputs ~shapes (nm, (sh, traits)) =
         let l =
           List.map
             (fun (nm, typ, traits) ->
-              assert (typ <> { namespace = "smithy.api"; identifier = "Unit" });
-              type_constructor
-                ~info:(documentation ~shapes traits)
-                ~arg_type:typ nm)
+              let arg_type = if typ = unit_type then None else Some typ in
+              type_constructor ~info:(documentation ~shapes traits) ?arg_type nm)
             l
         in
         B.type_declaration ~manifest:None ~kind:(Ptype_variant l)
@@ -741,14 +793,16 @@ let print_type ?heading ~inputs ~shapes (nm, (sh, traits)) =
     ptype_attributes = text @ docs;
   }
 
-let print_types ~inputs ~operations shapes =
+let print_types ~inputs ~outputs ~operations shapes =
   let types =
     IdMap.bindings
       (IdMap.filter
-         (fun _ (typ, _) ->
+         (fun id (typ, _) ->
            match typ with
            | Service _ | Operation _ | Resource _ -> false
-           | _ -> true)
+           | _ ->
+               IdSet.mem id inputs || IdSet.mem id outputs
+               || IdSet.mem id operations)
          shapes)
   in
   let operations, types =
@@ -790,6 +844,8 @@ let converter ~path ~sparse id =
                   | "Float" | "Double" -> "float"
                   | "Timestamp" -> "timestamp"
                   | "Document" -> "document"
+                  | "Short" -> "integer"
+                  | "Byte" -> "byte"
                   | _ -> assert false )))
     | _ -> ident (type_name id)
   in
@@ -847,9 +903,11 @@ let to_json (name, (sh, traits)) =
                                        (member_name ~name:"smithy.api#enumValue"
                                           enum))))
                            l)]]
-            | Integer -> [%expr Converters.To_JSON.integer [%e ident nm]]
+            | Integer | IntEnum | Short ->
+                [%expr Converters.To_JSON.integer [%e ident nm]]
             | Long -> [%expr Converters.To_JSON.long [%e ident nm]]
             | Float | Double -> [%expr Converters.To_JSON.float [%e ident nm]]
+            | Byte -> [%expr Converters.To_JSON.byte [%e ident nm]]
             | Timestamp -> [%expr Converters.To_JSON.timestamp [%e ident nm]]
             | Document -> [%expr Converters.To_JSON.document [%e ident nm]]
             | List (id, _) ->
@@ -889,16 +947,26 @@ let to_json (name, (sh, traits)) =
                         B.pexp_match (ident nm)
                           (List.map
                              (fun ((nm, typ, _) as constr) ->
-                               B.case
-                                 ~lhs:(pat_construct nm (Some [%pat? x]))
-                                 ~guard:None
-                                 ~rhs:
-                                   [%expr
-                                     [%e
-                                       B.pexp_constant
-                                         (const_string (member_name constr))],
-                                       [%e (converter ~path ~sparse:false) typ]
-                                         x])
+                               if typ = unit_type then
+                                 B.case ~lhs:(pat_construct nm None) ~guard:None
+                                   ~rhs:
+                                     [%expr
+                                       [%e
+                                         B.pexp_constant
+                                           (const_string (member_name constr))],
+                                         [%e structure_json_converter []]]
+                               else
+                                 B.case
+                                   ~lhs:(pat_construct nm (Some [%pat? x]))
+                                   ~guard:None
+                                   ~rhs:
+                                     [%expr
+                                       [%e
+                                         B.pexp_constant
+                                           (const_string (member_name constr))],
+                                         [%e
+                                           (converter ~path ~sparse:false) typ]
+                                           x])
                              l)];
                     ]]
             | Service _ | Resource _ | Operation _ -> assert false)
@@ -911,7 +979,7 @@ let print_to_json shs =
     end]
 
 let field_xml_converter ?param ((nm, typ, _) as field) =
-  let path = Longident.(Ldot (Lident "Converters", "To_JSON")) in
+  let path = Longident.(Ldot (Lident "Converters", "To_XML")) in
   let optional = param = None && optional_member field in
   let name =
     B.pexp_constant
@@ -968,9 +1036,11 @@ let to_xml (name, (sh, traits)) =
                                           (member_name
                                              ~name:"smithy.api#enumValue" enum))))
                               l)]]
-               | Integer -> [%expr Converters.To_XML.integer [%e ident nm]]
+               | Integer | IntEnum | Short ->
+                   [%expr Converters.To_XML.integer [%e ident nm]]
                | Long -> [%expr Converters.To_XML.long [%e ident nm]]
                | Float | Double -> [%expr Converters.To_XML.float [%e ident nm]]
+               | Byte -> [%expr Converters.To_XML.byte [%e ident nm]]
                | Timestamp -> [%expr Converters.To_XML.timestamp [%e ident nm]]
                | Document -> assert false
                | List (id, traits') ->
@@ -1076,11 +1146,13 @@ let query_alt_name ~protocol ~traits =
       | None -> None)
 
 let field_graph_converter ~protocol ?param ((nm, typ, traits) as field) =
-  let path = Longident.(Ldot (Lident "Converters", "To_JSON")) in
+  let path = Longident.(Ldot (Lident "Converters", "To_Graph")) in
   let optional = param = None && optional_member field in
   let name =
     let name = Option.value ~default:nm (query_alt_name ~protocol ~traits) in
-    assert (protocol <> `Ec2Query || String.capitalize_ascii name = name);
+    let name =
+      if protocol = `Ec2Query then String.capitalize_ascii name else name
+    in
     B.pexp_constant (const_string name)
   in
   let flat = flattened_member field in
@@ -1136,10 +1208,12 @@ let to_graph ~protocol (name, (sh, traits)) =
                                           (member_name
                                              ~name:"smithy.api#enumValue" enum))))
                               l)]]
-               | Integer -> [%expr Converters.To_Graph.integer [%e ident nm]]
+               | Integer | IntEnum | Short ->
+                   [%expr Converters.To_Graph.integer [%e ident nm]]
                | Long -> [%expr Converters.To_Graph.long [%e ident nm]]
                | Float | Double ->
                    [%expr Converters.To_Graph.float [%e ident nm]]
+               | Byte -> [%expr Converters.To_Graph.byte [%e ident nm]]
                | Timestamp ->
                    [%expr Converters.To_Graph.timestamp [%e ident nm]]
                | Document -> [%expr Converters.To_Graph.document [%e ident nm]]
@@ -1276,9 +1350,11 @@ let from_json (name, (sh, traits)) =
                         ~guard:None
                         ~rhs:[%expr assert false];
                     ])
-            | Integer -> [%expr Converters.From_JSON.integer [%e ident nm]]
+            | Integer | IntEnum | Short ->
+                [%expr Converters.From_JSON.integer [%e ident nm]]
             | Long -> [%expr Converters.From_JSON.long [%e ident nm]]
             | Float | Double -> [%expr Converters.From_JSON.float [%e ident nm]]
+            | Byte -> [%expr Converters.From_JSON.byte [%e ident nm]]
             | Timestamp -> [%expr Converters.From_JSON.timestamp [%e ident nm]]
             | Document -> [%expr Converters.From_JSON.document [%e ident nm]]
             | List (id, _) ->
@@ -1319,23 +1395,40 @@ let from_json (name, (sh, traits)) =
                   [%expr Converters.From_JSON.structure [%e ident nm]]
                   (List.map
                      (fun ((nm, typ, _) as constr) ->
-                       B.case
-                         ~lhs:
-                           [%pat?
-                             [
-                               ( [%p
-                                   B.ppat_constant
-                                     (const_string (member_name constr))],
-                                 x );
-                             ]]
-                         ~guard:None
-                         ~rhs:
-                           (B.pexp_construct
-                              (Location.mknoloc
-                                 (Longident.Lident (constr_name nm)))
-                              (Some
-                                 [%expr
-                                   [%e (converter ~path ~sparse:false) typ] x])))
+                       if typ = unit_type then
+                         B.case
+                           ~lhs:
+                             [%pat?
+                               [
+                                 ( [%p
+                                     B.ppat_constant
+                                       (const_string (member_name constr))],
+                                   _ );
+                               ]]
+                           ~guard:None
+                           ~rhs:
+                             (B.pexp_construct
+                                (Location.mknoloc
+                                   (Longident.Lident (constr_name nm)))
+                                None)
+                       else
+                         B.case
+                           ~lhs:
+                             [%pat?
+                               [
+                                 ( [%p
+                                     B.ppat_constant
+                                       (const_string (member_name constr))],
+                                   x );
+                               ]]
+                           ~guard:None
+                           ~rhs:
+                             (B.pexp_construct
+                                (Location.mknoloc
+                                   (Longident.Lident (constr_name nm)))
+                                (Some
+                                   [%expr
+                                     [%e (converter ~path ~sparse:false) typ] x])))
                      l
                   @ [
                       B.case
@@ -1394,10 +1487,12 @@ let from_xml (name, (sh, traits)) =
                            ~guard:None
                            ~rhs:[%expr assert false];
                        ])
-               | Integer -> [%expr Converters.From_XML.integer [%e ident nm]]
+               | Integer | IntEnum | Short ->
+                   [%expr Converters.From_XML.integer [%e ident nm]]
                | Long -> [%expr Converters.From_XML.long [%e ident nm]]
                | Float | Double ->
                    [%expr Converters.From_XML.float [%e ident nm]]
+               | Byte -> [%expr Converters.From_XML.byte [%e ident nm]]
                | Timestamp ->
                    [%expr Converters.From_XML.timestamp [%e ident nm]]
                | Document -> assert false
@@ -1519,7 +1614,7 @@ let print_from_xml shs =
       [%%i B.pstr_value Recursive (List.map from_xml (IdMap.bindings shs))]
     end]
 
-let compute_inputs_outputs shapes =
+let compute_inputs_outputs shapes (id, _) =
   let rec traverse set ~direct id =
     if IdSet.mem id set then set
     else
@@ -1528,11 +1623,13 @@ let compute_inputs_outputs shapes =
       | None -> set
       | Some (typ, _) -> (
           match typ with
-          | Blob | Boolean | String | Enum _ | Integer | Long | Float | Double
-          | Timestamp | Document ->
+          | Blob | Boolean | String | Enum _ | Integer | IntEnum | Long | Float
+          | Double | Short | Byte | Timestamp | Document ->
               set
           | Service _ | Resource _ | Operation _ -> assert false
-          | List (id, _) | Map (_, (id, _)) -> traverse set ~direct:false id
+          | List (id, _) -> traverse set ~direct:false id
+          | Map ((id, _), (id', _)) ->
+              traverse (traverse set ~direct:false id) ~direct:false id'
           | Structure l | Union l ->
               List.fold_left
                 (fun set (_, id, _) -> traverse set ~direct:false id)
@@ -1541,18 +1638,29 @@ let compute_inputs_outputs shapes =
   let traverse_list set lst =
     List.fold_left (fun set x -> traverse set ~direct:false x) set lst
   in
-  IdMap.fold
-    (fun _ (ty, _) (inputs, outputs, operations) ->
-      match ty with
-      | Service { errors; _ } ->
-          (inputs, traverse_list outputs errors, operations)
-      | Operation { input; output; errors } ->
-          ( traverse inputs ~direct:true input,
-            traverse_list (traverse outputs ~direct:false output) errors,
-            IdSet.add input (IdSet.add output operations) )
-      | _ -> (inputs, outputs, operations))
-    shapes
-    (IdSet.empty, IdSet.empty, IdSet.empty)
+  let rec traverse_resource sets id =
+    let ty, _ = IdMap.find id shapes in
+    match ty with
+    | Service { operations; resources; errors; _ } ->
+        let inputs, outputs, operations =
+          traverse_resources (traverse_resources sets operations) resources
+        in
+        (inputs, traverse_list outputs errors, operations)
+    | Operation { input; output; errors; _ } ->
+        let inputs, outputs, operations = sets in
+        ( traverse inputs ~direct:true input,
+          traverse_list (traverse outputs ~direct:false output) errors,
+          IdSet.add input (IdSet.add output operations) )
+    | Resource r ->
+        let opt x = match x with None -> [] | Some x -> [ x ] in
+        traverse_resources sets
+          (opt r.create @ opt r.put @ opt r.read @ opt r.update @ opt r.delete
+         @ opt r.list @ r.operations @ r.collection_operations @ r.resources)
+    | _ -> assert false
+  and traverse_resources sets lst =
+    List.fold_left (fun sets x -> traverse_resource sets x) sets lst
+  in
+  traverse_resource (IdSet.empty, IdSet.empty, IdSet.empty) id
 
 (*
 let compile_rest_operation ~shapes nm input output errors traits =
@@ -1582,8 +1690,150 @@ let compile_rest_operation ~shapes nm input output errors traits =
 ~errors:[("name", (retryable, fun x -> `Foo (From_Json.foo) x))); ...]
 *)
 
+let rec compile_value ~shapes typ v =
+  match type_of_shape shapes typ with
+  | String | Blob -> B.pexp_constant (const_string (Util.to_string v))
+  | Integer | IntEnum ->
+      B.pexp_constant (Pconst_integer (Int.to_string (Util.to_int v), None))
+  | Long ->
+      B.pexp_constant (Pconst_integer (Int.to_string (Util.to_int v), Some 'L'))
+  | Boolean -> if Util.to_bool v then [%expr true] else [%expr false]
+  | Float | Double -> (
+      match v with
+      | `String "NaN" -> [%expr Float.nan]
+      | `String "Infinity" -> [%expr Float.infinity]
+      | `String "-Infinity" -> [%expr Float.neg_infinity]
+      | `Float f -> B.pexp_constant (Pconst_float (Printf.sprintf "%h" f, None))
+      | _ -> assert false)
+  | Document ->
+      [%expr
+        Yojson.Safe.from_string
+          [%e B.pexp_constant (const_string (Yojson.Safe.to_string v))]]
+  | Timestamp ->
+      [%expr
+        CalendarLib.Calendar.from_unixfloat
+          [%e
+            B.pexp_constant
+              (Pconst_float (Printf.sprintf "%h" (Util.to_number v), None))]]
+  | Structure [] -> [%expr ()]
+  | Structure l ->
+      B.pexp_record
+        (List.map
+           (fun ((nm, typ', _) as field) ->
+             let optional = optional_member field in
+             let label = Location.mknoloc (Longident.Lident (field_name nm)) in
+             let v' = Util.(v |> member nm) in
+             ( label,
+               if optional then
+                 if v' = `Null then [%expr None]
+                 else [%expr Some [%e compile_value ~shapes typ' v']]
+               else compile_value ~shapes typ' v' ))
+           l)
+        None
+  | Union l -> (
+      match Util.to_assoc v with
+      | [ (nm, v') ] ->
+          let nm, typ', _ = List.find (fun (nm', _, _) -> nm = nm') l in
+          B.pexp_construct
+            (Location.mknoloc (Longident.Lident (constr_name nm)))
+            (if typ' = unit_type then None
+            else Some (compile_value ~shapes typ' v'))
+      | _ -> assert false)
+  | List (typ', _) ->
+      let sparse =
+        List.mem_assoc "smithy.api#sparse" (snd (IdMap.find typ shapes))
+      in
+      let l = Util.(v |> to_list) in
+      let l =
+        List.map
+          (fun v ->
+            if sparse then
+              if v = `Null then [%expr None]
+              else [%expr Some [%e compile_value ~shapes typ' v]]
+            else compile_value ~shapes typ' v)
+          l
+      in
+      List.fold_right (fun v rem -> [%expr [%e v] :: [%e rem]]) l [%expr []]
+  | Map (_, (typ', _)) ->
+      let sparse =
+        List.mem_assoc "smithy.api#sparse" (snd (IdMap.find typ shapes))
+      in
+      let l = Util.(v |> to_assoc) in
+      let l =
+        List.map
+          (fun (k, v) ->
+            ( B.pexp_constant (const_string k),
+              if sparse then
+                if v = `Null then [%expr None]
+                else [%expr Some [%e compile_value_with_type ~shapes typ' v]]
+              else compile_value_with_type ~shapes typ' v ))
+          l
+      in
+      List.fold_right
+        (fun (k, v) rem ->
+          [%expr Converters.StringMap.add [%e k] [%e v] [%e rem]])
+        l [%expr Converters.StringMap.empty]
+  | Enum l ->
+      let nm = Util.to_string v in
+      let nm', _, _ =
+        List.find
+          (fun enum -> member_name ~name:"smithy.api#enumValue" enum = nm)
+          l
+      in
+      B.pexp_construct
+        (Location.mknoloc (Longident.Lident (constr_name nm')))
+        None
+  | _ -> assert false
+
+and compile_value_with_type ~shapes typ v =
+  B.pexp_constraint (compile_value ~shapes typ v) (type_ident typ)
+
+let compile_parameters ~shapes typ v =
+  if typ = unit_type || v = `Null then [%expr ()]
+  else
+    match type_of_shape shapes typ with
+    | Structure l ->
+        let pl = Util.to_assoc v in
+        let pl =
+          List.map
+            (fun (nm, v') ->
+              let ((nm, typ', _) as field) =
+                List.find (fun (nm', _, _) -> nm = nm') l
+              in
+              let optional = optional_member field in
+              ( nm,
+                if optional then
+                  if v' = `Null then [%expr None]
+                  else [%expr Some [%e compile_value_with_type ~shapes typ' v']]
+                else compile_value_with_type ~shapes typ' v' ))
+            pl
+        in
+        [%expr
+          ignore
+            [%e
+              B.pexp_tuple
+                (List.map
+                   (fun (k, v) ->
+                     [%expr [%e B.pexp_constant (const_string k)], [%e v]])
+                   pl)]]
+    | _ -> assert false
+
+let compile_http_request_tests ~shapes ~input test =
+  prerr_endline test.id;
+  let t =
+    [%expr
+      [%e compile_parameters ~shapes input test.params];
+      true]
+  in
+  let t =
+    match test.documentation with
+    | None -> t
+    | Some doc -> { t with pexp_attributes = [ text_attr doc ] }
+  in
+  [%stri let%test [%p B.ppat_constant (const_string test.id)] = [%e t]]
+
 let compile_operation ~service_info ~protocol ~shapes nm
-    { input; output; errors } traits =
+    { input; output; errors; http_request_tests } traits =
   let field_refs name m =
     if name.namespace = "smithy.api" then m
     else
@@ -1614,7 +1864,7 @@ let compile_operation ~service_info ~protocol ~shapes nm
   in
   let builder =
     let fields =
-      if input = { namespace = "smithy.api"; identifier = "Unit" } then []
+      if input = unit_type then []
       else
         match IdMap.find input shapes with
         | Structure l, _ -> l
@@ -1662,7 +1912,9 @@ let compile_operation ~service_info ~protocol ~shapes nm
           :: [%e lst]])
       errors [%expr []]
   in
-  assert (not (String.contains (Option.value ~default:"" host_prefix) '{'));
+  (*ZZZ  assert (not (String.contains (Option.value ~default:"" host_prefix) '{'));*)
+  if String.contains (Option.value ~default:"" host_prefix) '{' then
+    prerr_endline (Option.value ~default:"" host_prefix);
   B.pstr_value Nonrecursive
     [
       {
@@ -1704,51 +1956,51 @@ let compile_operation ~service_info ~protocol ~shapes nm
         pvb_attributes = docs;
       };
     ]
+  :: List.map (compile_http_request_tests ~shapes ~input) http_request_tests
 
 let compile_operations ~service_info ~protocol ~shapes =
   let compile shs =
-    List.rev
-    @@ IdMap.fold
-         (fun nm (ty, traits) rem ->
-           match ty with
-           | Operation info ->
-               compile_operation ~service_info ~protocol ~shapes nm info traits
-               :: rem
-           | _ -> rem)
-         shs []
+    List.fold_right
+      (fun nm rem ->
+        let ty, traits = IdMap.find nm shapes in
+        match ty with
+        | Operation info ->
+            compile_operation ~service_info ~protocol ~shapes nm info traits
+            @ rem
+        | _ -> assert false)
+      shs []
   in
-  let shs, ops =
-    IdMap.fold
-      (fun nm (typ, traits) (shs, ops) ->
-        match typ with
-        | Resource r ->
-            let name =
-              nm.identifier |> to_snake_case
-              |> Re.replace_string Re.(compile (char '_')) ~by:" "
-              |> String.capitalize_ascii
-              |> fun s ->
-              if String.ends_with ~suffix:" resource" s then
-                String.sub s 0 (String.length s - 9)
-              else s
-            in
-            let add x l = match x with None -> l | Some x -> x :: l in
-            let operations =
-              r.operations @ r.collection_operations
-              |> add r.create |> add r.put |> add r.read |> add r.update
-              |> add r.delete |> add r.list
-            in
-            ( List.fold_left (fun shs x -> IdMap.remove x shs) shs operations,
-              (B.pstr_attribute (text_attr ("{2 " ^ name ^ "}"))
-               :: toplevel_documentation ~shapes traits
-              @ compile
-                  (List.fold_left
-                     (fun shs' id -> IdMap.add id (IdMap.find id shs) shs')
-                     IdMap.empty operations))
-              :: ops )
-        | _ -> (shs, ops))
-      shapes (shapes, [])
+  let rec compile_resources l =
+    List.concat
+    @@ List.fold_right
+         (fun nm ops ->
+           let typ, traits = IdMap.find nm shapes in
+           match typ with
+           | Resource r ->
+               let name =
+                 nm.identifier |> to_snake_case
+                 |> Re.replace_string Re.(compile (char '_')) ~by:" "
+                 |> String.capitalize_ascii
+                 |> fun s ->
+                 if String.ends_with ~suffix:" resource" s then
+                   String.sub s 0 (String.length s - 9)
+                 else s
+               in
+               let add x l = match x with None -> l | Some x -> x :: l in
+               let operations =
+                 r.operations @ r.collection_operations
+                 |> add r.list |> add r.delete |> add r.update |> add r.read
+                 |> add r.put |> add r.create
+               in
+               (B.pstr_attribute (text_attr ("{2 " ^ name ^ "}"))
+                :: toplevel_documentation ~shapes traits
+               @ compile operations
+               @ compile_resources r.resources)
+               :: ops
+           | _ -> assert false)
+         l []
   in
-  compile shs @ List.concat (List.rev ops)
+  compile service_info.operations @ compile_resources service_info.resources
 
 type expr =
   | Bool of bool
@@ -2066,14 +2318,7 @@ let protocols =
     ("aws.protocols#ec2Query", `Ec2Query);
   ]
 
-let compile dir f =
-  let shs = parse (Filename.concat dir f) in
-  let service =
-    IdMap.choose
-      (IdMap.filter
-         (fun _ (typ, _) -> match typ with Service _ -> true | _ -> false)
-         shs)
-  in
+let compile_service shs service =
   let name =
     let sdk_id =
       let _, (_, traits) = service in
@@ -2091,8 +2336,8 @@ let compile dir f =
   in
   let ch = open_out (Filename.concat "generated" (name ^ ".ml")) in
   let f = Format.formatter_of_out_channel ch in
-  let inputs, outputs, operations = compute_inputs_outputs shs in
-  let types = print_types ~inputs ~operations shs in
+  let inputs, outputs, operations = compute_inputs_outputs shs service in
+  let types = print_types ~inputs ~outputs ~operations shs in
   let input_shapes = IdMap.filter (fun id _ -> IdSet.mem id inputs) shs in
   let record_constructors = print_constructors input_shapes in
   let converters =
@@ -2116,16 +2361,17 @@ let compile dir f =
     match service with _, (Service info, _) -> info | _ -> assert false
   in
   let endpoint =
-    [
-      B.pstr_value Nonrecursive
+    match List.assoc_opt "smithy.rules#endpointRuleSet" (snd (snd service)) with
+    | Some ruleset ->
         [
-          B.value_binding
-            ~pat:(B.ppat_var (Location.mknoloc "aws_endpoint"))
-            ~expr:
-              (handle_endpoint
-                 (List.assoc "smithy.rules#endpointRuleSet" (snd (snd service))));
-        ];
-    ]
+          B.pstr_value Nonrecursive
+            [
+              B.value_binding
+                ~pat:(B.ppat_var (Location.mknoloc "aws_endpoint"))
+                ~expr:(handle_endpoint ruleset);
+            ];
+        ]
+    | None -> []
   in
   let operations =
     match protocol with
@@ -2145,6 +2391,14 @@ let compile dir f =
     @ toggle_hide
     @ (B.pstr_attribute (text_attr "{1 Operations}") :: operations));
   close_out ch
+
+let compile dir f =
+  let shs = parse (Filename.concat dir f) in
+  IdMap.iter
+    (fun nm info -> compile_service shs (nm, info))
+    (IdMap.filter
+       (fun _ (typ, _) -> match typ with Service _ -> true | _ -> false)
+       shs)
 
 let () =
   let _f { namespace = _; identifier = _ } = () in

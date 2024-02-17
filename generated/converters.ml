@@ -23,6 +23,12 @@ module To_JSON = struct
   let integer x = `Intlit (Int.to_string x)
   let long x = `Intlit (Int64.to_string x)
 
+  let byte x =
+    `Intlit
+      (Int.to_string
+         (let c = Char.code x in
+          if c > 127 then c - 256 else c))
+
   let float x =
     if x <> x then `String "NaN"
     else if 1. /. x <> 0. then `Float x
@@ -54,6 +60,8 @@ module From_JSON = struct
     | `Int x -> Int64.of_int x
     | `Intlit x -> Int64.of_string x
     | _ -> assert false
+
+  let byte x = Char.chr (integer x land 255)
 
   let float x =
     match x with
@@ -160,6 +168,14 @@ module To_XML = struct
   let integer x = [ `Data (Int.to_string x) ]
   let long x = [ `Data (Int64.to_string x) ]
 
+  let byte x =
+    [
+      `Data
+        (Int.to_string
+           (let c = Char.code x in
+            if c > 127 then c - 256 else c));
+    ]
+
   let float x =
     [
       `Data
@@ -200,6 +216,7 @@ module From_XML = struct
   let blob x = Base64.decode_exn (string x)
   let integer x = int_of_string (string x)
   let long x = Int64.of_string (string x)
+  let byte x = Char.chr (int_of_string (string x) land 255)
 
   let float x =
     match string x with
