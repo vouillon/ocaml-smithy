@@ -153,7 +153,6 @@ let unit_type = { namespace = "smithy.api"; identifier = "Unit" }
 
 let parse_http_request_test test =
   let open Util in
-  prerr_endline (test |> member "id" |> to_string);
   {
     id = test |> member "id" |> to_string;
     documentation = test |> member "documentation" |> to_option to_string;
@@ -185,7 +184,6 @@ let parse_http_request_test test =
 
 let parse_http_response_test test =
   let open Util in
-  prerr_endline (test |> member "id" |> to_string);
   {
     id = test |> member "id" |> to_string;
     documentation = test |> member "documentation" |> to_option to_string;
@@ -431,6 +429,8 @@ let type_of_shape shapes nm =
     | "Float" -> Float
     | "Double" -> Double
     | "Boolean" -> Boolean
+    | "Short" -> Short
+    | "Byte" -> Byte
     | "Blob" -> Blob
     | "Timestamp" -> Timestamp
     | _ ->
@@ -688,7 +688,7 @@ let default_value ~shapes ~rename typ default =
   match default with
   | `String s -> (
       match type_of_shape shapes typ with
-      | String -> B.pexp_constant (const_string s)
+      | String | Blob -> B.pexp_constant (const_string s)
       | Enum _ ->
           [%expr
             ([%e
@@ -696,7 +696,9 @@ let default_value ~shapes ~rename typ default =
                  (Location.mknoloc (Longident.Lident (constr_name s)))
                  None]
               : [%t type_ident ~rename typ])]
-      | _ -> assert false)
+      | _ ->
+          prerr_endline typ.identifier;
+          assert false)
   | `Int n ->
       B.pexp_constant
         (match type_of_shape shapes typ with
@@ -1830,11 +1832,12 @@ let compile_rest_operation ~shapes nm input output errors traits =
 let rec compile_value ~shapes ~rename typ v =
   match type_of_shape shapes typ with
   | String | Blob -> B.pexp_constant (const_string (Util.to_string v))
-  | Integer | IntEnum ->
+  | Integer | IntEnum | Short ->
       B.pexp_constant (Pconst_integer (Int.to_string (Util.to_int v), None))
   | Long ->
       B.pexp_constant (Pconst_integer (Int.to_string (Util.to_int v), Some 'L'))
   | Boolean -> if Util.to_bool v then [%expr true] else [%expr false]
+  | Byte -> B.pexp_constant (Pconst_char (Char.chr (Util.to_int v land 255)))
   | Float | Double -> (
       match v with
       | `String "NaN" -> [%expr Float.nan]
@@ -1856,7 +1859,7 @@ let rec compile_value ~shapes ~rename typ v =
   | Structure l ->
       B.pexp_record
         (List.map
-           (fun ((nm, typ', _) as field) ->
+           (fun ((nm, typ', traits') as field) ->
              let optional = optional_member field in
              let label = Location.mknoloc (Longident.Lident (field_name nm)) in
              let v' = Util.(v |> member nm) in
@@ -1864,7 +1867,12 @@ let rec compile_value ~shapes ~rename typ v =
                if optional then
                  if v' = `Null then [%expr None]
                  else [%expr Some [%e compile_value ~shapes ~rename typ' v']]
-               else compile_value ~shapes ~rename typ' v' ))
+               else
+                 let v' =
+                   if v' = `Null then List.assoc "smithy.api#default" traits'
+                   else v'
+                 in
+                 compile_value ~shapes ~rename typ' v' ))
            l)
         None
   | Union l -> (
@@ -2078,8 +2086,7 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                          (Option.value ~default:"NONE" request.body)
                          body;
                      request.body = Some body]
-               | Some _ -> assert false
-               | None ->
+               | None | Some ("application/octet-stream" | "image/jpg") ->
                    let body = B.pexp_constant (const_string body) in
                    [%expr
                      let body = [%e body] in
@@ -2087,7 +2094,10 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                        Format.eprintf "<%s> <%s>@."
                          (Option.value ~default:"NONE" request.body)
                          body;
-                     request.body = Some body])]]
+                     request.body = Some body]
+               | Some typ ->
+                   prerr_endline typ;
+                   assert false)]]
   in
   let t =
     match test.documentation with
@@ -2144,8 +2154,134 @@ let compile_http_response_tests ~shapes ~rename ~output op_name
   in
   [%stri let%test [%p B.ppat_constant (const_string test.id)] = [%e t]]
 
-let compile_operation ~service_id ~service_info ~protocol ~shapes ~rename nm
-    { input; output; errors; http_request_tests; http_response_tests } traits =
+let compile_rest_json_operation ~service_id ~service_info ~shapes ~rename nm
+    { input; output; errors; _ } traits =
+  let field_refs name m =
+    if name.namespace = "smithy.api" then m
+    else
+      match IdMap.find name shapes with
+      | Structure l, _ ->
+          List.fold_left
+            (fun m (nm, _, _) -> StringMap.add nm name.identifier m)
+            m l
+      | _ -> assert false
+  in
+  let docs =
+    (if input.namespace = "smithy.api" then []
+    else
+      [
+        doc_attr
+          ("See type {!type:" ^ type_name ~rename input
+         ^ "} for a description of the parameters");
+      ])
+    @ documentation ~shapes
+        ~field_refs:(StringMap.empty |> field_refs output |> field_refs input)
+        traits
+  in
+  (* Method: POST, uri: / *)
+  let host_prefix =
+    Option.map
+      (fun e -> Util.(e |> member "hostPrefix" |> to_string))
+      (List.assoc_opt "smithy.api#endpoint" traits)
+  in
+  let fields =
+    if input = unit_type then []
+    else
+      match IdMap.find input shapes with
+      | Structure l, _ -> l
+      | _ -> assert false
+  in
+  let builder =
+    [%expr
+      fun k ->
+        [%e
+          constructor_parameters ~shapes ~rename ~fields
+            ~body:
+              (List.fold_left
+                 (fun expr (nm, _, _) ->
+                   B.pexp_let Nonrecursive
+                     [
+                       B.value_binding
+                         ~pat:
+                           (B.ppat_var (Location.mknoloc (field_name nm ^ "'")))
+                         ~expr:(ident (field_name nm));
+                     ]
+                     expr)
+                 [%expr
+                   k
+                     (let open! To_JSON in
+                     [%e
+                       structure_json_converter ~rename ~fixed_fields:true
+                         (*ZZZ*) fields])]
+                 fields)]]
+  in
+  let errors = service_info.errors @ errors in
+  let errors =
+    List.fold_right
+      (fun name lst ->
+        [%expr
+          ( [%e B.pexp_constant (const_string name.identifier)],
+            fun x ->
+              [%e
+                B.pexp_variant
+                  (constr_name name.identifier)
+                  (Some
+                     [%expr
+                       [%e
+                         B.pexp_ident
+                           (Location.mknoloc
+                              (Longident.Ldot
+                                 (Lident "From_JSON", type_name ~rename name)))]
+                         x])] )
+          :: [%e lst]])
+      errors [%expr []]
+  in
+  (*ZZZ  assert (not (String.contains (Option.value ~default:"" host_prefix) '{'));*)
+  if String.contains (Option.value ~default:"" host_prefix) '{' then
+    prerr_endline (Option.value ~default:"" host_prefix);
+  B.pstr_value Nonrecursive
+    [
+      {
+        (B.value_binding
+           ~pat:(B.ppat_var (Location.mknoloc (type_name ~rename nm)))
+           ~expr:
+             [%expr
+               fun () ->
+                 Converters.create_rest_json_operation
+                   ~host_prefix:
+                     [%e
+                       match host_prefix with
+                       | None -> [%expr None]
+                       | Some host_prefix ->
+                           [%expr
+                             Some
+                               [%e B.pexp_constant (const_string host_prefix)]]]
+                   ~target:
+                     [%e
+                       B.pexp_constant
+                         (const_string
+                            (service_id.identifier ^ "." ^ nm.identifier))]
+                   ~builder:[%e builder]
+                   ~parser:
+                     [%e
+                       B.pexp_ident
+                         (Location.mknoloc
+                            (if output.namespace = "smithy.api" then
+                             Longident.(
+                               Ldot
+                                 ( Ldot (Lident "Converters", "From_JSON"),
+                                   type_name ~rename output ))
+                            else
+                              Longident.Ldot
+                                (Lident "From_JSON", type_name ~rename output)))]
+                   ~errors:[%e errors]])
+        with
+        pvb_attributes = docs;
+      };
+    ]
+
+let compile_json_operation ~service_id ~service_info ~protocol ~shapes ~rename
+    nm { input; output; errors; _ } traits =
   let field_refs name m =
     if name.namespace = "smithy.api" then m
     else
@@ -2274,8 +2410,29 @@ let compile_operation ~service_id ~service_info ~protocol ~shapes ~rename nm
         pvb_attributes = docs;
       };
     ]
+
+let compile_operation ~service_id ~service_info ~protocol ~shapes ~rename nm
+    ({ input; output; http_request_tests; http_response_tests; _ } as info)
+    traits =
+  (match protocol with
+  | (`AwsJson1_1 | `AwsJson1_0) as protocol ->
+      compile_json_operation ~service_id ~service_info ~protocol ~shapes ~rename
+        nm info traits
+  | `RestJson1 ->
+      compile_rest_json_operation ~service_id ~service_info ~shapes ~rename nm
+        info traits)
   ::
-  (let has_optionals = structure_has_optionals fields || fields = [] in
+  (let has_optionals =
+     let fields =
+       if input = unit_type then []
+       else
+         match IdMap.find input shapes with
+         | Structure l, _ -> l
+         | _ -> assert false
+     in
+     structure_has_optionals fields || fields = []
+   in
+   (*ZZZ tests associated to errors *)
    List.map
      (compile_http_request_tests ~shapes ~rename ~input has_optionals nm)
      (List.filter
@@ -2300,8 +2457,11 @@ let compile_operations ~service_id ~service_info ~protocol ~shapes ~rename =
         let ty, traits = IdMap.find nm shapes in
         match ty with
         | Operation info ->
-            compile_operation ~service_id ~service_info ~protocol ~shapes
-              ~rename nm info traits
+            (match protocol with
+            | (`AwsJson1_1 | `AwsJson1_0 | `RestJson1) as protocol ->
+                compile_operation ~service_id ~service_info ~protocol ~shapes
+                  ~rename nm info traits
+            | _ -> [])
             @ rem
         | _ -> assert false)
       shs []
@@ -2715,11 +2875,8 @@ let compile_service shs service =
     | None -> []
   in
   let operations =
-    match protocol with
-    | (`AwsJson1_1 | `AwsJson1_0) as protocol ->
-        compile_operations ~service_id:(fst service) ~service_info ~protocol
-          ~shapes:shs ~rename
-    | _ -> []
+    compile_operations ~service_id:(fst service) ~service_info ~protocol
+      ~shapes:shs ~rename
   in
   let toggle_hide = [ B.pstr_attribute (text_attr "/*") ] in
   Format.fprintf f "%a@." Ppxlib.Pprintast.structure

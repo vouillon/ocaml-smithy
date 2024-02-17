@@ -100,7 +100,7 @@ end
     (Http.Response.t * Body.t) Lwt.t
 *)
 
-type meth = POST
+type meth = GET | POST | PUT
 
 type request = {
   uri : Uri.t;
@@ -130,6 +130,42 @@ let create_JSON_operation ~variant ~host_prefix ~target ~builder ~parser ~errors
         | `AwsJson1_1 -> "application/x-amz-json-1.1" );
       ("X-Amz-Target", target);
     ]
+  in
+  {
+    builder =
+      (fun endpoint k ->
+        builder (fun body ->
+            (*ZZZ*)
+            assert (Uri.host endpoint <> None);
+            k
+              {
+                uri =
+                  Uri.with_uri
+                    ~host:
+                      (Option.map
+                         (fun host_prefix ->
+                           host_prefix
+                           ^ Uri.host_with_default ~default:"" endpoint)
+                         host_prefix)
+                    endpoint;
+                meth = POST;
+                headers;
+                body = Some (Yojson.Safe.to_string body);
+              }));
+    parser =
+      (fun response ->
+        let body =
+          if response.body = "" then `Assoc []
+          else Yojson.Safe.from_string response.body
+        in
+        if response.code < 300 then Result.Ok (parser body)
+        else Result.error (List.assoc "foo" (*ZZZ*) errors body));
+  }
+
+let create_rest_json_operation ~host_prefix ~target ~builder ~parser ~errors =
+  (* Use hostname, protocol (https if not set) and path from endpoint *)
+  let headers =
+    [ ("Content-Type", "application/json"); ("X-Amz-Target", target) ]
   in
   {
     builder =
