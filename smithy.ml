@@ -79,6 +79,9 @@ type http_request_test = {
   documentation : string option;
   method_ : string option;
   uri : string;
+  query_params : string list option;
+  forbid_query_params : string list;
+  require_query_params : string list;
   headers : (string * string) list option;
   forbid_headers : string list;
   require_headers : string list;
@@ -161,6 +164,16 @@ let parse_http_request_test test =
     host = test |> member "host" |> to_option to_string;
     resolved_host = test |> member "resolvedHost" |> to_option to_string;
     params = test |> member "params";
+    query_params =
+      test |> member "queryParams"
+      |> to_option (fun h -> h |> to_list |> List.map to_string);
+    forbid_query_params =
+      test |> member "forbidQueryParams" |> to_option to_list
+      |> Option.value ~default:[] |> List.map to_string;
+    require_query_params =
+      test
+      |> member "requireQueryParams"
+      |> to_option to_list |> Option.value ~default:[] |> List.map to_string;
     headers =
       test |> member "headers"
       |> to_option (fun h ->
@@ -684,16 +697,28 @@ let toplevel_documentation ~shapes traits =
 let type_ident ~rename id =
   B.ptyp_constr (Location.mknoloc (Longident.Lident (type_name ~rename id))) []
 
+let member_name ~fixed ?(name = "smithy.api#jsonName") (nm, _, traits) =
+  if fixed then nm
+  else
+    try Yojson.Safe.Util.to_string (List.assoc name traits)
+    with Not_found -> nm
+
 let default_value ~shapes ~rename typ default =
   match default with
   | `String s -> (
       match type_of_shape shapes typ with
       | String | Blob -> B.pexp_constant (const_string s)
-      | Enum _ ->
+      | Enum l ->
+          let nm, _, _ =
+            List.find
+              (fun enum ->
+                member_name ~fixed:false ~name:"smithy.api#enumValue" enum = s)
+              l
+          in
           [%expr
             ([%e
                B.pexp_construct
-                 (Location.mknoloc (Longident.Lident (constr_name s)))
+                 (Location.mknoloc (Longident.Lident (constr_name nm)))
                  None]
               : [%t type_ident ~rename typ])]
       | _ ->
@@ -707,7 +732,10 @@ let default_value ~shapes ~rename typ default =
         | Long -> Pconst_integer (Int.to_string n, Some 'L')
         | _ -> assert false)
   | `Bool b -> if b then [%expr true] else [%expr false]
-  | _ -> assert false
+  | `List [] -> [%expr []]
+  | _ ->
+      Format.eprintf "DEFAULT %s@." (Yojson.Safe.to_string default);
+      assert false
 
 let structure_has_optionals fields =
   List.exists
@@ -938,12 +966,6 @@ let converter ~rename ~path ~sparse id =
       [%e B.pexp_ident (Location.mknoloc (Longident.Ldot (path, "option")))]
         [%e convert id]]
   else convert id
-
-let member_name ~fixed ?(name = "smithy.api#jsonName") (nm, _, traits) =
-  if fixed then nm
-  else
-    try Yojson.Safe.Util.to_string (List.assoc name traits)
-    with Not_found -> nm
 
 let pat_construct nm =
   B.ppat_construct (Location.mknoloc (Longident.Lident (constr_name nm)))
@@ -1829,6 +1851,35 @@ let compile_rest_operation ~shapes nm input output errors traits =
 ~errors:[("name", (retryable, fun x -> `Foo (From_Json.foo) x))); ...]
 *)
 
+let to_caml_list l =
+  List.fold_right (fun e rem -> [%expr [%e e] :: [%e rem]]) l [%expr []]
+
+let tag_re =
+  Re.(
+    compile
+      (seq
+         [
+           char '{';
+           group (rep1 (diff any (set "+#}")));
+           opt (seq [ char '#'; group (rep1 (diff any (set "}"))) ]);
+           opt (char '+');
+           char '}';
+         ]))
+
+let compile_string s f =
+  match Re.split_full tag_re s with
+  | [ `Text s ] -> B.pexp_constant (const_string s)
+  | l ->
+      let l =
+        List.map
+          (fun x ->
+            match x with
+            | `Text s -> B.pexp_constant (const_string s)
+            | `Delim g -> f (Re.Group.get g 1) (Re.Group.get_opt g 2))
+          l
+      in
+      [%expr String.concat "" [%e to_caml_list l]]
+
 let rec compile_value ~shapes ~rename typ v =
   match type_of_shape shapes typ with
   | String | Blob -> B.pexp_constant (const_string (Util.to_string v))
@@ -1990,11 +2041,88 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
       in
       [%e
         [%expr
-          Uri.path request.uri = [%e B.pexp_constant (const_string test.uri)]]
+          let path = [%e B.pexp_constant (const_string test.uri)] in
+          let success = Uri.path request.uri = path in
+          if not success then
+            Format.eprintf "<%s> <%s>@." (Uri.path request.uri) path;
+          success]
         |> add_test test.resolved_host (fun host ->
                [%expr
                  Uri.host request.uri
                  = Some [%e B.pexp_constant (const_string host)]])
+        |> add_test
+             (if test.forbid_query_params = [] then None
+             else Some test.forbid_query_params)
+             (fun params ->
+               let params =
+                 List.fold_right
+                   (fun h rem ->
+                     [%expr [%e B.pexp_constant (const_string h)] :: [%e rem]])
+                   params [%expr []]
+               in
+               [%expr
+                 let params = [%e params] in
+                 let fail =
+                   List.exists
+                     (fun (h, _) -> List.mem h params)
+                     (Uri.query request.uri)
+                 in
+                 if fail then (
+                   List.iter
+                     (fun (k, l) ->
+                       List.iter (fun v -> Format.eprintf "%s:%s@." k v) l)
+                     (Uri.query request.uri);
+                   Format.eprintf "@.");
+                 not fail])
+        |> add_test
+             (if test.require_query_params = [] then None
+             else Some test.require_query_params)
+             (fun params ->
+               let params =
+                 List.fold_right
+                   (fun h rem ->
+                     [%expr [%e B.pexp_constant (const_string h)] :: [%e rem]])
+                   params [%expr []]
+               in
+               [%expr
+                 let params = [%e params] in
+                 let fail =
+                   List.exists
+                     (fun h -> List.mem_assoc h (Uri.query request.uri))
+                     headers
+                 in
+                 if fail then (
+                   List.iter
+                     (fun (k, l) ->
+                       List.iter (fun v -> Format.eprintf "%s:%s@." k v) l)
+                     (Uri.query request.uri);
+                   Format.eprintf "@.");
+                 not fail])
+        |> add_test test.query_params (fun params ->
+               let params =
+                 List.fold_right
+                   (fun v rem ->
+                     [%expr [%e B.pexp_constant (const_string v)] :: [%e rem]])
+                   params [%expr []]
+               in
+               [%expr
+                 let params = [%e params] in
+                 let fail =
+                   List.exists
+                     (fun p ->
+                       let i = String.index p '=' in
+                       let k = String.sub p 0 i in
+                       let v = String.sub p (i + 1) (String.length p - i - 1) in
+                       List.assoc_opt k (Uri.query request.uri) <> Some [ v ])
+                     params
+                 in
+                 if fail then (
+                   List.iter
+                     (fun (k, l) ->
+                       List.iter (fun v -> Format.eprintf "%s:%s@." k v) l)
+                     (Uri.query request.uri);
+                   Format.eprintf "@.");
+                 not fail])
         |> add_test
              (if test.forbid_headers = [] then None
              else Some test.forbid_headers)
@@ -2043,11 +2171,16 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                  not fail])
         |> add_test test.method_ (fun meth ->
                [%expr
-                 request.meth
-                 = [%e
-                     B.pexp_construct
-                       (Location.mknoloc (Longident.Lident (constr_name meth)))
-                       None]])
+                 let success =
+                   request.meth
+                   = [%e
+                       B.pexp_construct
+                         (Location.mknoloc
+                            (Longident.Lident (constr_name meth)))
+                         None]
+                 in
+                 if not success then Format.eprintf "Bad method@.";
+                 success])
         |> add_test test.headers (fun headers ->
                let headers =
                  List.fold_right
@@ -2081,20 +2214,16 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                    in
                    [%expr
                      let body = [%e body] in
-                     if Option.value ~default:"NONE" request.body <> body then
-                       Format.eprintf "<%s> <%s>@."
-                         (Option.value ~default:"NONE" request.body)
-                         body;
-                     request.body = Some body]
+                     if request.body <> body then
+                       Format.eprintf "<%s> <%s>@." request.body body;
+                     request.body = body]
                | None | Some ("application/octet-stream" | "image/jpg") ->
                    let body = B.pexp_constant (const_string body) in
                    [%expr
                      let body = [%e body] in
-                     if Option.value ~default:"NONE" request.body <> body then
-                       Format.eprintf "<%s> <%s>@."
-                         (Option.value ~default:"NONE" request.body)
-                         body;
-                     request.body = Some body]
+                     if request.body <> body then
+                       Format.eprintf "<%s> <%s>@." request.body body;
+                     request.body = body]
                | Some typ ->
                    prerr_endline typ;
                    assert false)]]
@@ -2154,8 +2283,32 @@ let compile_http_response_tests ~shapes ~rename ~output op_name
   in
   [%stri let%test [%p B.ppat_constant (const_string test.id)] = [%e t]]
 
-let compile_rest_json_operation ~service_id ~service_info ~shapes ~rename nm
+let compile_pattern ~shapes ~rename ~fields s =
+  compile_string s @@ fun label property ->
+  assert (property = None);
+  let t = ident (uncapitalized_identifier label) in
+  let _, typ, _ = List.find (fun (nm, _, _) -> nm = label) fields in
+  match type_of_shape shapes typ with
+  | String -> t
+  | Boolean -> [%expr Converters.To_String.boolean [%e t]]
+  | Integer | Short -> [%expr Converters.To_String.integer [%e t]]
+  | Long -> [%expr Converters.To_String.long [%e t]]
+  | Byte -> [%expr Converters.To_String.byte [%e t]]
+  | Float | Double -> [%expr Converters.To_String.float [%e t]]
+  | Timestamp -> [%expr Converters.To_String.timestamp [%e t]]
+  | Enum _ ->
+      [%expr
+        Yojson.Safe.Util.to_string
+          (To_JSON.([%e ident (type_name ~rename typ)]) [%e t])]
+  | _ ->
+      Format.eprintf "ZZZ %s@." typ.identifier;
+      assert false
+
+let compile_rest_json_operation ~service_info ~shapes ~rename nm
     { input; output; errors; _ } traits =
+  let http = List.assoc "smithy.api#http" traits in
+  let meth = Util.(http |> member "method" |> to_string) in
+  let path = Util.(http |> member "uri" |> to_string) in
   let field_refs name m =
     if name.namespace = "smithy.api" then m
     else
@@ -2212,7 +2365,16 @@ let compile_rest_json_operation ~service_id ~service_info ~shapes ~rename nm
                      (let open! To_JSON in
                      [%e
                        structure_json_converter ~rename ~fixed_fields:true
-                         (*ZZZ*) fields])]
+                         (*ZZZ*) fields])
+                     [%e
+                       match host_prefix with
+                       | Some prefix ->
+                           [%expr
+                             Some
+                               [%e
+                                 compile_pattern ~shapes ~rename ~fields prefix]]
+                       | None -> [%expr None]]
+                     [%e compile_pattern ~shapes ~rename ~fields path]]
                  fields)]]
   in
   let errors = service_info.errors @ errors in
@@ -2236,9 +2398,6 @@ let compile_rest_json_operation ~service_id ~service_info ~shapes ~rename nm
           :: [%e lst]])
       errors [%expr []]
   in
-  (*ZZZ  assert (not (String.contains (Option.value ~default:"" host_prefix) '{'));*)
-  if String.contains (Option.value ~default:"" host_prefix) '{' then
-    prerr_endline (Option.value ~default:"" host_prefix);
   B.pstr_value Nonrecursive
     [
       {
@@ -2248,19 +2407,12 @@ let compile_rest_json_operation ~service_id ~service_info ~shapes ~rename nm
              [%expr
                fun () ->
                  Converters.create_rest_json_operation
-                   ~host_prefix:
+                   ~method_:
                      [%e
-                       match host_prefix with
-                       | None -> [%expr None]
-                       | Some host_prefix ->
-                           [%expr
-                             Some
-                               [%e B.pexp_constant (const_string host_prefix)]]]
-                   ~target:
-                     [%e
-                       B.pexp_constant
-                         (const_string
-                            (service_id.identifier ^ "." ^ nm.identifier))]
+                       B.pexp_construct
+                         (Location.mknoloc
+                            (Longident.Lident (constr_name meth)))
+                         None]
                    ~builder:[%e builder]
                    ~parser:
                      [%e
@@ -2338,7 +2490,15 @@ let compile_json_operation ~service_id ~service_info ~protocol ~shapes ~rename
                      (let open! To_JSON in
                      [%e
                        structure_json_converter ~rename ~fixed_fields:true
-                         (*ZZZ*) fields])]
+                         (*ZZZ*) fields])
+                     [%e
+                       match host_prefix with
+                       | Some prefix ->
+                           [%expr
+                             Some
+                               [%e
+                                 compile_pattern ~shapes ~rename ~fields prefix]]
+                       | None -> [%expr None]]]
                  fields)]]
   in
   let errors = service_info.errors @ errors in
@@ -2362,9 +2522,6 @@ let compile_json_operation ~service_id ~service_info ~protocol ~shapes ~rename
           :: [%e lst]])
       errors [%expr []]
   in
-  (*ZZZ  assert (not (String.contains (Option.value ~default:"" host_prefix) '{'));*)
-  if String.contains (Option.value ~default:"" host_prefix) '{' then
-    prerr_endline (Option.value ~default:"" host_prefix);
   B.pstr_value Nonrecursive
     [
       {
@@ -2379,14 +2536,6 @@ let compile_json_operation ~service_id ~service_info ~protocol ~shapes ~rename
                        match protocol with
                        | `AwsJson1_0 -> B.pexp_variant "AwsJson1_0" None
                        | `AwsJson1_1 -> B.pexp_variant "AwsJson1_1" None]
-                   ~host_prefix:
-                     [%e
-                       match host_prefix with
-                       | None -> [%expr None]
-                       | Some host_prefix ->
-                           [%expr
-                             Some
-                               [%e B.pexp_constant (const_string host_prefix)]]]
                    ~target:
                      [%e
                        B.pexp_constant
@@ -2419,8 +2568,7 @@ let compile_operation ~service_id ~service_info ~protocol ~shapes ~rename nm
       compile_json_operation ~service_id ~service_info ~protocol ~shapes ~rename
         nm info traits
   | `RestJson1 ->
-      compile_rest_json_operation ~service_id ~service_info ~shapes ~rename nm
-        info traits)
+      compile_rest_json_operation ~service_info ~shapes ~rename nm info traits)
   ::
   (let has_optionals =
      let fields =
@@ -2482,7 +2630,11 @@ let compile_operations ~service_id ~service_info ~protocol ~shapes ~rename =
                    String.sub s 0 (String.length s - 9)
                  else s
                in
-               let add x l = match x with None -> l | Some x -> x :: l in
+               let add x l =
+                 match x with
+                 | None -> l
+                 | Some x -> x :: List.filter (fun y -> x <> y) l
+               in
                let operations =
                  r.operations @ r.collection_operations
                  |> add r.list |> add r.delete |> add r.update |> add r.read
@@ -2498,217 +2650,196 @@ let compile_operations ~service_id ~service_info ~protocol ~shapes ~rename =
   in
   compile service_info.operations @ compile_resources service_info.resources
 
-type expr =
-  | Bool of bool
-  | String of string
-  | Int of int
-  | Apply of { f : string; args : expr list; assign : string option }
-  | Var of string
+module Rules = struct
+  type expr =
+    | Bool of bool
+    | String of string
+    | Int of int
+    | Apply of { f : string; args : expr list; assign : string option }
+    | Var of string
 
-type rule = { conditions : expr list; desc : rule_desc }
+  type rule = { conditions : expr list; desc : rule_desc }
 
-and rule_desc =
-  | Tree of rule list
-  | Error of string
-  | Endpoint of {
-      url : expr;
-      auth_schemes : auth_schemes list option;
-      headers : (string * string) list;
-    }
+  and rule_desc =
+    | Tree of rule list
+    | Error of string
+    | Endpoint of {
+        url : expr;
+        auth_schemes : auth_schemes list option;
+        headers : (string * string) list;
+      }
 
-and auth_schemes = {
-  name : string;
-  signing_region : string option;
-  signing_region_set : string list option;
-  signing_name : string;
-  disable_double_encoding : bool option;
-}
+  and auth_schemes = {
+    name : string;
+    signing_region : string option;
+    signing_region_set : string list option;
+    signing_name : string;
+    disable_double_encoding : bool option;
+  }
 
-let to_caml_list l =
-  List.fold_right (fun e rem -> [%expr [%e e] :: [%e rem]]) l [%expr []]
+  let array_access_re =
+    Re.(
+      compile
+        (whole_string
+           (seq [ group (rep any); char '['; group (rep any); char ']' ])))
 
-let tag_re =
-  Re.(
-    compile
-      (seq
-         [
-           char '{';
-           group (rep1 (diff any (set "#}")));
-           opt (seq [ char '#'; group (rep1 (diff any (set "}"))) ]);
-           char '}';
-         ]))
+  let compile_string s =
+    compile_string s (fun label property ->
+        let t = uncapitalized_identifier label in
+        let t =
+          if t = "endpoint" then [%expr Uri.to_string [%e ident t]] else ident t
+        in
+        match property with
+        | None -> t
+        | Some f ->
+            B.pexp_field t
+              (Location.mknoloc
+                 Longident.(
+                   Ldot
+                     ( Ldot (Lident "Converters", "Endpoint"),
+                       uncapitalized_identifier f ))))
 
-let compile_string s =
-  match Re.split_full tag_re s with
-  | [ `Text s ] -> B.pexp_constant (const_string s)
-  | l ->
-      let l =
-        List.map
-          (fun x ->
-            match x with
-            | `Text s -> B.pexp_constant (const_string s)
-            | `Delim g -> (
-                let t = uncapitalized_identifier (Re.Group.get g 1) in
-                let t =
-                  if t = "endpoint" then [%expr Uri.to_string [%e ident t]]
-                  else ident t
-                in
-                match Re.Group.get_opt g 2 with
-                | None -> t
-                | Some f ->
-                    B.pexp_field t
-                      (Location.mknoloc
-                         Longident.(
-                           Ldot
-                             ( Ldot (Lident "Converters", "Endpoint"),
-                               uncapitalized_identifier f )))))
-          l
-      in
+  let rec compile_expr e =
+    match e with
+    | Bool b -> if b then [%expr true] else [%expr false]
+    | String s -> compile_string s
+    | Int i -> B.pexp_constant (Pconst_integer (Int.to_string i, None))
+    | Var nm -> ident (uncapitalized_identifier nm)
+    | Apply { f; args; _ } -> (
+        let fn f =
+          B.pexp_ident
+            (Location.mknoloc
+               Longident.(Ldot (Ldot (Lident "Converters", "Endpoint"), f)))
+        in
+        match (f, args) with
+        | "aws.isVirtualHostableS3Bucket", [ b; b' ] ->
+            [%expr
+              [%e fn "is_virtual_hostable_s3_bucket"]
+                [%e compile_expr b] [%e compile_expr b']]
+        | "aws.parseArn", [ b ] ->
+            [%expr [%e fn "parse_arn"] [%e compile_expr b]]
+        | "aws.partition", [ r ] ->
+            [%expr [%e fn "partition"] [%e compile_expr r]]
+        | "booleanEquals", ([ e; Bool true ] | [ Bool true; e ]) ->
+            compile_expr e
+        | "booleanEquals", [ e; Bool false ] -> [%expr not [%e compile_expr e]]
+        | "booleanEquals", [ e; e' ] ->
+            [%expr [%e compile_expr e] = [%e compile_expr e']]
+        | "getAttr", [ r; String s ] -> (
+            match Re.exec_opt array_access_re s with
+            | Some g ->
+                [%expr
+                  [%e fn "array_get_opt"]
+                    [%e
+                      B.pexp_field (compile_expr r)
+                        (Location.mknoloc
+                           Longident.(
+                             Ldot
+                               ( Ldot (Lident "Converters", "Endpoint"),
+                                 uncapitalized_identifier (Re.Group.get g 1) )))]
+                    [%e
+                      B.pexp_constant (Pconst_integer (Re.Group.get g 2, None))]]
+            | None ->
+                B.pexp_field (compile_expr r)
+                  (Location.mknoloc
+                     Longident.(
+                       Ldot
+                         ( Ldot (Lident "Converters", "Endpoint"),
+                           uncapitalized_identifier s ))))
+        | "isSet", [ e ] -> [%expr [%e compile_expr e] <> None]
+        | "isValidHostLabel", [ e; e' ] ->
+            [%expr
+              [%e fn "is_valid_host_label"] [%e compile_expr e]
+                [%e compile_expr e']]
+        | "not", [ Apply { f = "isSet"; args = [ e ]; _ } ] ->
+            [%expr [%e compile_expr e] = None]
+        | "not", [ e ] -> [%expr not [%e compile_expr e]]
+        | "parseURL", [ e ] -> [%expr [%e fn "parse_url"] [%e compile_expr e]]
+        | "stringEquals", [ e; e' ] ->
+            [%expr [%e compile_expr e] = [%e compile_expr e']]
+        | "substring", [ s; i; j; rev ] ->
+            [%expr
+              [%e fn "substring"] [%e compile_expr s] [%e compile_expr i]
+                [%e compile_expr j] [%e compile_expr rev]]
+        | "uriEncode", [ e ] ->
+            [%expr
+              Some (Uri.pct_encode ~component:`Generic [%e compile_expr e])]
+        | _ ->
+            Format.eprintf "%s@." f;
+            assert false)
 
-      [%expr String.concat "" [%e to_caml_list l]]
-
-let array_access_re =
-  Re.(
-    compile
-      (whole_string
-         (seq [ group (rep any); char '['; group (rep any); char ']' ])))
-
-let rec compile_expr e =
-  match e with
-  | Bool b -> if b then [%expr true] else [%expr false]
-  | String s -> compile_string s
-  | Int i -> B.pexp_constant (Pconst_integer (Int.to_string i, None))
-  | Var nm -> ident (uncapitalized_identifier nm)
-  | Apply { f; args; _ } -> (
-      let fn f =
-        B.pexp_ident
-          (Location.mknoloc
-             Longident.(Ldot (Ldot (Lident "Converters", "Endpoint"), f)))
-      in
-      match (f, args) with
-      | "aws.isVirtualHostableS3Bucket", [ b; b' ] ->
+  let rec compile_rule rule =
+    let body =
+      match rule.desc with
+      | Tree l -> compile_rule_list l
+      | Error s -> [%expr Some (Result.error [%e compile_string s])]
+      | Endpoint { url; headers; _ } ->
           [%expr
-            [%e fn "is_virtual_hostable_s3_bucket"]
-              [%e compile_expr b] [%e compile_expr b']]
-      | "aws.parseArn", [ b ] -> [%expr [%e fn "parse_arn"] [%e compile_expr b]]
-      | "aws.partition", [ r ] ->
-          [%expr [%e fn "partition"] [%e compile_expr r]]
-      | "booleanEquals", ([ e; Bool true ] | [ Bool true; e ]) -> compile_expr e
-      | "booleanEquals", [ e; Bool false ] -> [%expr not [%e compile_expr e]]
-      | "booleanEquals", [ e; e' ] ->
-          [%expr [%e compile_expr e] = [%e compile_expr e']]
-      | "getAttr", [ r; String s ] -> (
-          match Re.exec_opt array_access_re s with
-          | Some g ->
-              [%expr
-                [%e fn "array_get_opt"]
-                  [%e
-                    B.pexp_field (compile_expr r)
-                      (Location.mknoloc
-                         Longident.(
-                           Ldot
-                             ( Ldot (Lident "Converters", "Endpoint"),
-                               uncapitalized_identifier (Re.Group.get g 1) )))]
-                  [%e B.pexp_constant (Pconst_integer (Re.Group.get g 2, None))]]
-          | None ->
-              B.pexp_field (compile_expr r)
-                (Location.mknoloc
-                   Longident.(
-                     Ldot
-                       ( Ldot (Lident "Converters", "Endpoint"),
-                         uncapitalized_identifier s ))))
-      | "isSet", [ e ] -> [%expr [%e compile_expr e] <> None]
-      | "isValidHostLabel", [ e; e' ] ->
-          [%expr
-            [%e fn "is_valid_host_label"] [%e compile_expr e]
-              [%e compile_expr e']]
-      | "not", [ Apply { f = "isSet"; args = [ e ]; _ } ] ->
-          [%expr [%e compile_expr e] = None]
-      | "not", [ e ] -> [%expr not [%e compile_expr e]]
-      | "parseURL", [ e ] -> [%expr [%e fn "parse_url"] [%e compile_expr e]]
-      | "stringEquals", [ e; e' ] ->
-          [%expr [%e compile_expr e] = [%e compile_expr e']]
-      | "substring", [ s; i; j; rev ] ->
-          [%expr
-            [%e fn "substring"] [%e compile_expr s] [%e compile_expr i]
-              [%e compile_expr j] [%e compile_expr rev]]
-      | "uriEncode", [ e ] ->
-          [%expr Some (Uri.pct_encode ~component:`Generic [%e compile_expr e])]
-      | _ ->
-          Format.eprintf "%s@." f;
-          assert false)
+            Some
+              (Result.ok
+                 ( [%e
+                     match url with
+                     | Var "Endpoint" -> [%expr Uri.to_string endpoint]
+                     | _ -> compile_expr url],
+                   [%e
+                     to_caml_list
+                       (List.map
+                          (fun (k, v) ->
+                            [%expr
+                              [%e B.pexp_constant (const_string k)],
+                                [%e compile_string v]])
+                          headers)] ))]
+      (*ZZZ*)
+    in
+    List.fold_right
+      (fun expr rem ->
+        let e = compile_expr expr in
+        match expr with
+        | Apply { assign = Some x; _ } ->
+            [%expr
+              let* [%p
+                     B.ppat_var (Location.mknoloc (uncapitalized_identifier x))]
+                  =
+                [%e e]
+              in
+              [%e rem]]
+        | Apply { f = "isSet"; args = [ Var x ]; _ } ->
+            let x = uncapitalized_identifier x in
+            [%expr
+              let* [%p B.ppat_var (Location.mknoloc x)] = [%e ident x] in
+              [%e rem]]
+        | Apply { f = "aws.parseArn"; _ } ->
+            [%expr
+              let* _ = [%e e] in
+              [%e rem]]
+        | _ ->
+            [%expr
+              let* () = check [%e e] in
+              [%e rem]])
+      rule.conditions body
 
-let rec compile_rule rule =
-  let body =
-    match rule.desc with
-    | Tree l -> compile_rule_list l
-    | Error s -> [%expr Some (Result.error [%e compile_string s])]
-    | Endpoint { url; headers; _ } ->
+  and compile_rule_list rules =
+    match rules with
+    | [ rule ] -> compile_rule rule
+    | _ ->
         [%expr
-          Some
-            (Result.ok
-               ( [%e
-                   match url with
-                   | Var "Endpoint" -> [%expr Uri.to_string endpoint]
-                   | _ -> compile_expr url],
-                 [%e
-                   to_caml_list
-                     (List.map
-                        (fun (k, v) ->
-                          [%expr
-                            [%e B.pexp_constant (const_string k)],
-                              [%e compile_string v]])
-                        headers)] ))]
-    (*ZZZ*)
-  in
-  List.fold_right
-    (fun expr rem ->
-      let e = compile_expr expr in
-      match expr with
-      | Apply { assign = Some x; _ } ->
-          [%expr
-            let* [%p B.ppat_var (Location.mknoloc (uncapitalized_identifier x))]
-                =
-              [%e e]
-            in
-            [%e rem]]
-      | Apply { f = "isSet"; args = [ Var x ]; _ } ->
-          let x = uncapitalized_identifier x in
-          [%expr
-            let* [%p B.ppat_var (Location.mknoloc x)] = [%e ident x] in
-            [%e rem]]
-      | Apply { f = "aws.parseArn"; _ } ->
-          [%expr
-            let* _ = [%e e] in
-            [%e rem]]
-      | _ ->
-          [%expr
-            let* () = check [%e e] in
-            [%e rem]])
-    rule.conditions body
+          seq
+            [%e
+              List.fold_right
+                (fun rule rem ->
+                  [%expr (fun () -> [%e compile_rule rule]) :: [%e rem]])
+                rules [%expr []]]]
 
-and compile_rule_list rules =
-  match rules with
-  | [ rule ] -> compile_rule rule
-  | _ ->
-      [%expr
-        seq
-          [%e
-            List.fold_right
-              (fun rule rem ->
-                [%expr (fun () -> [%e compile_rule rule]) :: [%e rem]])
-              rules [%expr []]]]
-
-let handle_endpoint ruleset =
-  let rec expr c =
-    match c with
-    | `Bool _ -> Bool Util.(to_bool c)
-    | `String _ -> String Util.(to_string c)
-    | `Int _ -> Int Util.(to_int c)
-    | `Assoc _ ->
-        if Util.member "fn" c <> `Null then
-          let f = Util.(c |> member "fn" |> to_string) in
-          (*
+  let handle_endpoint ruleset =
+    let rec expr c =
+      match c with
+      | `Bool _ -> Bool Util.(to_bool c)
+      | `String _ -> String Util.(to_string c)
+      | `Int _ -> Int Util.(to_int c)
+      | `Assoc _ ->
+          if Util.member "fn" c <> `Null then
+            let f = Util.(c |> member "fn" |> to_string) in
+            (*
       2 aws.isVirtualHostableS3Bucket
         ====> packages/util-endpoints/src/lib/aws/isVirtualHostableS3Bucket.ts
       7 aws.parseArn
@@ -2724,85 +2855,87 @@ let handle_endpoint ruleset =
       5 substring
       2 uriEncode
 *)
-          let args = Util.(c |> member "argv" |> to_list |> List.map expr) in
-          let assign = Util.(c |> member "assign" |> to_option to_string) in
-          Apply { f; args; assign }
-        else if Util.member "ref" c <> `Null then (
-          assert (Util.member "assert" c = `Null);
-          Var Util.(c |> member "ref" |> to_string))
-        else assert false
-    | _ -> assert false
-  in
-  let auth_schemes s =
-    {
-      name = Util.(s |> member "name" |> to_string);
-      signing_region = Util.(s |> member "signingRegion" |> to_option to_string);
-      signing_region_set =
-        Util.(
-          s |> member "signingRegionSet" |> to_option to_list
-          |> Option.map (List.map to_string));
-      signing_name = Util.(s |> member "signingName" |> to_string);
-      disable_double_encoding =
-        Util.(s |> member "disableDoubleEncoding" |> to_option to_bool);
-    }
-  in
-  let rec rule_list r = List.map rule Util.(r |> member "rules" |> to_list)
-  and rule r =
-    let typ = Util.(r |> member "type" |> to_string) in
-    {
-      conditions = Util.(r |> member "conditions" |> to_list |> List.map expr);
-      desc =
-        (match typ with
-        | "tree" -> Tree (rule_list r)
-        | "endpoint" ->
-            let e = Util.(r |> member "endpoint") in
-            Endpoint
-              {
-                url = Util.(e |> member "url" |> expr);
-                headers =
-                  Util.(
-                    e |> member "headers" |> to_assoc
-                    |> List.map (fun (nm, value) ->
-                           ( nm,
-                             value |> to_list |> fun l ->
-                             match l with
-                             | [ s ] -> to_string s
-                             | _ -> assert false )));
-                auth_schemes =
-                  Util.(
-                    e |> member "properties" |> member "authSchemes"
-                    |> to_option to_list
-                    |> Option.map (List.map auth_schemes));
-              }
-        | "error" -> Error Util.(r |> member "error" |> to_string)
-        | _ -> assert false);
-    }
-  in
-  let parameters =
-    Util.(
-      ruleset |> member "parameters" |> to_assoc
-      |> List.map (fun (nm, info) ->
-             ( nm,
-               info |> member "required" |> to_bool,
-               info |> member "default" |> to_option to_bool )))
-  in
-  let rules = rule_list ruleset in
-  List.fold_right
-    (fun (p, required, default) rem ->
-      let p = uncapitalized_identifier p in
-      B.pexp_fun
-        (if (*p = "region" ||*) required && default = None then Labelled p
-        else Optional p)
-        (Option.map
-           (fun b -> if b then [%expr true] else [%expr false])
-           default)
-        (B.ppat_var (Location.mknoloc p))
-        rem)
-    parameters
-    [%expr
-      fun () ->
-        let open Converters.Endpoint.Rules in
-        [%e compile_rule_list rules]]
+            let args = Util.(c |> member "argv" |> to_list |> List.map expr) in
+            let assign = Util.(c |> member "assign" |> to_option to_string) in
+            Apply { f; args; assign }
+          else if Util.member "ref" c <> `Null then (
+            assert (Util.member "assert" c = `Null);
+            Var Util.(c |> member "ref" |> to_string))
+          else assert false
+      | _ -> assert false
+    in
+    let auth_schemes s =
+      {
+        name = Util.(s |> member "name" |> to_string);
+        signing_region =
+          Util.(s |> member "signingRegion" |> to_option to_string);
+        signing_region_set =
+          Util.(
+            s |> member "signingRegionSet" |> to_option to_list
+            |> Option.map (List.map to_string));
+        signing_name = Util.(s |> member "signingName" |> to_string);
+        disable_double_encoding =
+          Util.(s |> member "disableDoubleEncoding" |> to_option to_bool);
+      }
+    in
+    let rec rule_list r = List.map rule Util.(r |> member "rules" |> to_list)
+    and rule r =
+      let typ = Util.(r |> member "type" |> to_string) in
+      {
+        conditions = Util.(r |> member "conditions" |> to_list |> List.map expr);
+        desc =
+          (match typ with
+          | "tree" -> Tree (rule_list r)
+          | "endpoint" ->
+              let e = Util.(r |> member "endpoint") in
+              Endpoint
+                {
+                  url = Util.(e |> member "url" |> expr);
+                  headers =
+                    Util.(
+                      e |> member "headers" |> to_assoc
+                      |> List.map (fun (nm, value) ->
+                             ( nm,
+                               value |> to_list |> fun l ->
+                               match l with
+                               | [ s ] -> to_string s
+                               | _ -> assert false )));
+                  auth_schemes =
+                    Util.(
+                      e |> member "properties" |> member "authSchemes"
+                      |> to_option to_list
+                      |> Option.map (List.map auth_schemes));
+                }
+          | "error" -> Error Util.(r |> member "error" |> to_string)
+          | _ -> assert false);
+      }
+    in
+    let parameters =
+      Util.(
+        ruleset |> member "parameters" |> to_assoc
+        |> List.map (fun (nm, info) ->
+               ( nm,
+                 info |> member "required" |> to_bool,
+                 info |> member "default" |> to_option to_bool )))
+    in
+    let rules = rule_list ruleset in
+    List.fold_right
+      (fun (p, required, default) rem ->
+        let p = uncapitalized_identifier p in
+        B.pexp_fun
+          (if (*p = "region" ||*) required && default = None then Labelled p
+          else Optional p)
+          (Option.map
+             (fun b -> if b then [%expr true] else [%expr false])
+             default)
+          (B.ppat_var (Location.mknoloc p))
+          rem)
+      parameters
+      [%expr
+        fun () ->
+          let open Converters.Endpoint.Rules in
+          [%e compile_rule_list rules]]
+end
 
 let protocols =
   [
@@ -2869,7 +3002,7 @@ let compile_service shs service =
             [
               B.value_binding
                 ~pat:(B.ppat_var (Location.mknoloc "aws_endpoint"))
-                ~expr:(handle_endpoint ruleset);
+                ~expr:(Rules.handle_endpoint ruleset);
             ];
         ]
     | None -> []

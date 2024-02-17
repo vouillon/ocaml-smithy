@@ -16,18 +16,31 @@ module Timestamp = struct
   let from_epoch_seconds = CalendarLib.Calendar.from_unixfloat
 end
 
+module To_String = struct
+  let boolean x = if x then "true" else "false"
+  let integer = Int.to_string
+  let long = Int64.to_string
+
+  let byte x =
+    Int.to_string
+      (let c = Char.code x in
+       if c > 127 then c - 256 else c)
+
+  let float x = Printf.sprintf "%.0f" x
+  let timestamp x = Printf.sprintf "%.0f" (Timestamp.to_epoch_seconds x)
+end
+
 module To_JSON = struct
   let boolean x = `Bool x
   let blob x = `String (Base64.encode_string x)
   let string x = `String x
-  let integer x = `Intlit (Int.to_string x)
+  let integer x = `Int x
   let long x = `Intlit (Int64.to_string x)
 
   let byte x =
-    `Intlit
-      (Int.to_string
-         (let c = Char.code x in
-          if c > 127 then c - 256 else c))
+    `Int
+      (let c = Char.code x in
+       if c > 127 then c - 256 else c)
 
   let float x =
     if x <> x then `String "NaN"
@@ -100,13 +113,13 @@ end
     (Http.Response.t * Body.t) Lwt.t
 *)
 
-type meth = GET | POST | PUT
+type meth = GET | POST | PUT | HEAD | DELETE | PATCH
 
 type request = {
   uri : Uri.t;
   meth : meth;
   headers : (string * string) list;
-  body : string option;
+  body : string;
 }
 
 type response = { code : int; body : string }
@@ -119,8 +132,7 @@ type (+'perform, -'result, +'response, +'error) operation = {
 type retryable = Retryable | Throttling | Non_retryable
 type ('key, 'value) map = 'value StringMap.t
 
-let create_JSON_operation ~variant ~host_prefix ~target ~builder ~parser ~errors
-    =
+let create_JSON_operation ~variant ~target ~builder ~parser ~errors =
   (* Use hostname, protocol (https if not set) and path from endpoint *)
   let headers =
     [
@@ -134,7 +146,7 @@ let create_JSON_operation ~variant ~host_prefix ~target ~builder ~parser ~errors
   {
     builder =
       (fun endpoint k ->
-        builder (fun body ->
+        builder (fun body host_prefix ->
             (*ZZZ*)
             assert (Uri.host endpoint <> None);
             k
@@ -150,7 +162,7 @@ let create_JSON_operation ~variant ~host_prefix ~target ~builder ~parser ~errors
                     endpoint;
                 meth = POST;
                 headers;
-                body = Some (Yojson.Safe.to_string body);
+                body = Yojson.Safe.to_string body;
               }));
     parser =
       (fun response ->
@@ -162,15 +174,13 @@ let create_JSON_operation ~variant ~host_prefix ~target ~builder ~parser ~errors
         else Result.error (List.assoc "foo" (*ZZZ*) errors body));
   }
 
-let create_rest_json_operation ~host_prefix ~target ~builder ~parser ~errors =
+let create_rest_json_operation ~method_ ~builder ~parser ~errors =
   (* Use hostname, protocol (https if not set) and path from endpoint *)
-  let headers =
-    [ ("Content-Type", "application/json"); ("X-Amz-Target", target) ]
-  in
+  let headers = [ ("Content-Type", "application/json") ] in
   {
     builder =
       (fun endpoint k ->
-        builder (fun body ->
+        builder (fun body host_prefix path ->
             (*ZZZ*)
             assert (Uri.host endpoint <> None);
             k
@@ -183,10 +193,13 @@ let create_rest_json_operation ~host_prefix ~target ~builder ~parser ~errors =
                            host_prefix
                            ^ Uri.host_with_default ~default:"" endpoint)
                          host_prefix)
-                    endpoint;
-                meth = POST;
+                    ~path:(Some path) endpoint;
+                meth = method_;
                 headers;
-                body = Some (Yojson.Safe.to_string body);
+                body =
+                  (match body with
+                  | `Assoc [] -> ""
+                  | _ -> Yojson.Safe.to_string body);
               }));
     parser =
       (fun response ->
@@ -360,6 +373,7 @@ module To_Graph = struct
   let structure l = List.concat l
 end
 
+(*ZZZ This should be generated *)
 module Endpoint = struct
   type region_info = {
     supports_fips : bool;
