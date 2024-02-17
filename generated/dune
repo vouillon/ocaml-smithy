@@ -1,10 +1,10 @@
 (library
  (name aws)
  (public_name aws-sdk)
- (modes byte)
+;; (modes byte)
  (inline_tests)
  (libraries calendar yojson base64 uri xmlm)
-  (preprocess (pps ppx_inline_test)))
+ (preprocess (pps ppx_inline_test)))
 
 (env
  (_

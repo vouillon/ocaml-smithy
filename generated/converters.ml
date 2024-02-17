@@ -32,14 +32,16 @@ module To_JSON = struct
   let float x =
     if x <> x then `String "NaN"
     else if 1. /. x <> 0. then `Float x
-    else `String (if x < 0. then "Infinity" else "-Infinity")
+    else `String (if x < 0. then "-Infinity" else "Infinity")
 
-  let timestamp x = `Float (Timestamp.to_epoch_seconds x)
+  let timestamp x =
+    `Intlit (Printf.sprintf "%.0f" (Timestamp.to_epoch_seconds x))
+
   let document x = x
   let option f x = match x with None -> `Null | Some x -> f x
   let list f x = `List (List.map f x)
   let map f x = `Assoc (StringMap.bindings (StringMap.map f x))
-  let structure l = `Assoc l
+  let structure l = `Assoc (List.filter (fun (k, v) -> v <> `Null) l)
 end
 
 module From_JSON = struct
@@ -73,7 +75,7 @@ module From_JSON = struct
     | `Intlit x -> float_of_string x
     | _ -> assert false
 
-  let timestamp x = Timestamp.from_epoch_seconds (to_float x)
+  let timestamp x = Timestamp.from_epoch_seconds (to_number x)
   let document x = x
   let option f x = if x = `Null then None else Some (f x)
   let list f x = List.map f (to_list x)
@@ -84,6 +86,7 @@ module From_JSON = struct
       StringMap.empty (to_assoc x)
 
   let structure l = to_assoc l
+  let field nm l = try List.assoc nm l with Not_found -> `Null
   let unit _ = ()
 end
 
@@ -151,12 +154,12 @@ let create_JSON_operation ~variant ~host_prefix ~target ~builder ~parser ~errors
               }));
     parser =
       (fun response ->
-        if response.code < 300 then
-          Result.Ok (parser (Yojson.Safe.from_string response.body))
-        else
-          Result.error
-            (List.assoc "foo" (*ZZZ*) errors
-               (Yojson.Safe.from_string response.body)));
+        let body =
+          if response.body = "" then `Assoc []
+          else Yojson.Safe.from_string response.body
+        in
+        if response.code < 300 then Result.Ok (parser body)
+        else Result.error (List.assoc "foo" (*ZZZ*) errors body));
   }
 
 module To_XML = struct
@@ -181,8 +184,8 @@ module To_XML = struct
       `Data
         (if x <> x then "NaN"
         else if 1. /. x <> 0. then Float.to_string x (*ZZZ*)
-        else if x < 0. then "Infinity"
-        else "-Infinity");
+        else if x < 0. then "-Infinity"
+        else "Infinity");
     ]
 
   let timestamp x = [ `Data (Timestamp.to_date_time x) ]
@@ -293,8 +296,8 @@ module To_Graph = struct
       `Data
         (if x <> x then "NaN"
         else if 1. /. x <> 0. then Float.to_string x (*ZZZ*)
-        else if x < 0. then "Infinity"
-        else "-Infinity");
+        else if x < 0. then "-Infinity"
+        else "Infinity");
     ]
 
   let timestamp x = [ `Data (Timestamp.to_date_time x) ]
