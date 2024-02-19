@@ -26,7 +26,12 @@ module To_String = struct
       (let c = Char.code x in
        if c > 127 then c - 256 else c)
 
-  let float x = Printf.sprintf "%.0f" x
+  let float x =
+    if x <> x then "NaN"
+    else if 1. /. x <> 0. then Float.to_string x
+    else if x < 0. then "-Infinity"
+    else "Infinity"
+
   let timestamp x = Printf.sprintf "%.0f" (Timestamp.to_epoch_seconds x)
 end
 
@@ -119,10 +124,10 @@ type request = {
   uri : Uri.t;
   meth : meth;
   headers : (string * string) list;
-  body : string;
+  body : string option;
 }
 
-type response = { code : int; body : string }
+type response = { code : int; headers : (string * string) list; body : string }
 
 type (+'perform, -'result, +'response, +'error) operation = {
   builder : Uri.t -> (request -> 'result) -> 'perform;
@@ -162,7 +167,7 @@ let create_JSON_operation ~variant ~target ~builder ~parser ~errors =
                     endpoint;
                 meth = POST;
                 headers;
-                body = Yojson.Safe.to_string body;
+                body = Some (Yojson.Safe.to_string body);
               }));
     parser =
       (fun response ->
@@ -180,8 +185,9 @@ let create_rest_json_operation ~method_ ~builder ~parser ~errors =
   {
     builder =
       (fun endpoint k ->
-        builder (fun body host_prefix path ->
+        builder (fun body host_prefix uri query _headers ->
             (*ZZZ*)
+            let uri = Uri.of_string uri in
             assert (Uri.host endpoint <> None);
             k
               {
@@ -193,13 +199,21 @@ let create_rest_json_operation ~method_ ~builder ~parser ~errors =
                            host_prefix
                            ^ Uri.host_with_default ~default:"" endpoint)
                          host_prefix)
-                    ~path:(Some path) endpoint;
+                    ~path:
+                      (Some
+                         (let p = Uri.path endpoint in
+                          (if String.ends_with ~suffix:"/" p then
+                           String.sub p 0 (String.length p - 1)
+                          else p)
+                          ^ Uri.path uri))
+                    ~query:(Some (Uri.query uri @ query))
+                    endpoint;
                 meth = method_;
-                headers;
+                headers = (match body with `Assoc [] -> [] | _ -> headers);
                 body =
                   (match body with
-                  | `Assoc [] -> ""
-                  | _ -> Yojson.Safe.to_string body);
+                  | `Assoc [] -> None
+                  | _ -> Some (Yojson.Safe.to_string body));
               }));
     parser =
       (fun response ->

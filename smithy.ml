@@ -97,6 +97,7 @@ type http_response_test = {
   id : string;
   documentation : string option;
   code : int;
+  headers : (string * string) list option;
   body : string option;
   params : Yojson.Safe.t;
   applies_to : [ `Client | `Server ] option;
@@ -202,6 +203,10 @@ let parse_http_response_test test =
     documentation = test |> member "documentation" |> to_option to_string;
     code = test |> member "code" |> to_int;
     params = test |> member "params";
+    headers =
+      test |> member "headers"
+      |> to_option (fun h ->
+             h |> to_assoc |> List.map (fun (k, v) -> (k, to_string v)));
     body = test |> member "body" |> to_option to_string;
     applies_to =
       ( test |> member "appliesTo" |> fun s ->
@@ -1862,7 +1867,7 @@ let tag_re =
            char '{';
            group (rep1 (diff any (set "+#}")));
            opt (seq [ char '#'; group (rep1 (diff any (set "}"))) ]);
-           opt (char '+');
+           opt (group (char '+'));
            char '}';
          ]))
 
@@ -1875,7 +1880,8 @@ let compile_string s f =
           (fun x ->
             match x with
             | `Text s -> B.pexp_constant (const_string s)
-            | `Delim g -> f (Re.Group.get g 1) (Re.Group.get_opt g 2))
+            | `Delim g ->
+                f (Re.Group.get g 1) (Re.Group.get_opt g 2) (Re.Group.test g 3))
           l
       in
       [%expr String.concat "" [%e to_caml_list l]]
@@ -2039,12 +2045,20 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
              :: compile_parameters ~shapes ~rename input test.params
             @ if has_optionals then [ (Nolabel, [%expr ()]) ] else [])]
       in
+      let request_headers =
+        match request.body with
+        | Some b ->
+            ("Content-Length", string_of_int (String.length b))
+            :: request.headers
+        | None -> request.headers
+      in
+      ignore request_headers;
       [%e
         [%expr
           let path = [%e B.pexp_constant (const_string test.uri)] in
           let success = Uri.path request.uri = path in
           if not success then
-            Format.eprintf "<%s> <%s>@." (Uri.path request.uri) path;
+            Format.eprintf "path: <%s> <%s>@." (Uri.path request.uri) path;
           success]
         |> add_test test.resolved_host (fun host ->
                [%expr
@@ -2088,7 +2102,7 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                  let params = [%e params] in
                  let fail =
                    List.exists
-                     (fun h -> List.mem_assoc h (Uri.query request.uri))
+                     (fun h -> not (List.mem_assoc h (Uri.query request.uri)))
                      headers
                  in
                  if fail then (
@@ -2110,10 +2124,16 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                  let fail =
                    List.exists
                      (fun p ->
-                       let i = String.index p '=' in
-                       let k = String.sub p 0 i in
-                       let v = String.sub p (i + 1) (String.length p - i - 1) in
-                       List.assoc_opt k (Uri.query request.uri) <> Some [ v ])
+                       match String.index p '=' with
+                       | i ->
+                           let k = String.sub p 0 i in
+                           let v =
+                             String.sub p (i + 1) (String.length p - i - 1)
+                           in
+                           List.assoc_opt k (Uri.query request.uri)
+                           <> Some [ Uri.pct_decode v ]
+                       | exception Not_found ->
+                           List.assoc_opt p (Uri.query request.uri) <> Some [])
                      params
                  in
                  if fail then (
@@ -2138,12 +2158,12 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                  let fail =
                    List.exists
                      (fun (h, _) -> List.mem h headers)
-                     request.headers
+                     request_headers
                  in
                  if fail then (
                    List.iter
                      (fun (k, v) -> Format.eprintf "%s:%s@." k v)
-                     request.headers;
+                     request_headers;
                    Format.eprintf "@.");
                  not fail])
         |> add_test
@@ -2160,13 +2180,13 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                  let headers = [%e headers] in
                  let fail =
                    List.exists
-                     (fun h -> List.mem_assoc h request.headers)
+                     (fun h -> not (List.mem_assoc h request_headers))
                      headers
                  in
                  if fail then (
                    List.iter
                      (fun (k, v) -> Format.eprintf "%s:%s@." k v)
-                     request.headers;
+                     request_headers;
                    Format.eprintf "@.");
                  not fail])
         |> add_test test.method_ (fun meth ->
@@ -2195,13 +2215,13 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                  let headers = [%e headers] in
                  let fail =
                    List.exists
-                     (fun (k, v) -> List.assoc_opt k request.headers <> Some v)
+                     (fun (k, v) -> List.assoc_opt k request_headers <> Some v)
                      headers
                  in
                  if fail then (
                    List.iter
                      (fun (k, v) -> Format.eprintf "%s:%s@." k v)
-                     request.headers;
+                     request_headers;
                    Format.eprintf "@.");
                  not fail])
         |> add_test test.body (fun body ->
@@ -2214,16 +2234,18 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                    in
                    [%expr
                      let body = [%e body] in
-                     if request.body <> body then
-                       Format.eprintf "<%s> <%s>@." request.body body;
-                     request.body = body]
+                     let req_body = Option.value ~default:"" request.body in
+                     if req_body <> body then
+                       Format.eprintf "<%s> <%s>@." req_body body;
+                     req_body = body]
                | None | Some ("application/octet-stream" | "image/jpg") ->
                    let body = B.pexp_constant (const_string body) in
                    [%expr
                      let body = [%e body] in
-                     if request.body <> body then
-                       Format.eprintf "<%s> <%s>@." request.body body;
-                     request.body = body]
+                     let req_body = Option.value ~default:"" request.body in
+                     if req_body <> body then
+                       Format.eprintf "<%s> <%s>@." req_body body;
+                     req_body = body]
                | Some typ ->
                    prerr_endline typ;
                    assert false)]]
@@ -2255,6 +2277,16 @@ let compile_http_response_tests ~shapes ~rename ~output op_name
               [%e
                 B.pexp_constant
                   (const_string (Option.value ~default:"" test.body))];
+            headers =
+              [%e
+                List.fold_right
+                  (fun (k, v) rem ->
+                    [%expr
+                      ( [%e B.pexp_constant (const_string k)],
+                        [%e B.pexp_constant (const_string v)] )
+                      :: [%e rem]])
+                  (Option.value ~default:[] test.headers)
+                  [%expr []]];
           }
       in
       match response with
@@ -2283,32 +2315,44 @@ let compile_http_response_tests ~shapes ~rename ~output op_name
   in
   [%stri let%test [%p B.ppat_constant (const_string test.id)] = [%e t]]
 
-let compile_pattern ~shapes ~rename ~fields s =
-  compile_string s @@ fun label property ->
-  assert (property = None);
-  let t = ident (uncapitalized_identifier label) in
-  let _, typ, _ = List.find (fun (nm, _, _) -> nm = label) fields in
+let convert_to_string ~shapes ~rename ~fields nm expr =
+  let _, typ, _ = List.find (fun (nm', _, _) -> nm' = nm) fields in
   match type_of_shape shapes typ with
-  | String -> t
-  | Boolean -> [%expr Converters.To_String.boolean [%e t]]
-  | Integer | Short -> [%expr Converters.To_String.integer [%e t]]
-  | Long -> [%expr Converters.To_String.long [%e t]]
-  | Byte -> [%expr Converters.To_String.byte [%e t]]
-  | Float | Double -> [%expr Converters.To_String.float [%e t]]
-  | Timestamp -> [%expr Converters.To_String.timestamp [%e t]]
+  | String -> expr
+  | Boolean -> [%expr Converters.To_String.boolean [%e expr]]
+  | Integer | Short -> [%expr Converters.To_String.integer [%e expr]]
+  | Long -> [%expr Converters.To_String.long [%e expr]]
+  | Byte -> [%expr Converters.To_String.byte [%e expr]]
+  | Float | Double -> [%expr Converters.To_String.float [%e expr]]
+  | Timestamp -> [%expr Converters.To_String.timestamp [%e expr]]
   | Enum _ ->
       [%expr
         Yojson.Safe.Util.to_string
-          (To_JSON.([%e ident (type_name ~rename typ)]) [%e t])]
+          (To_JSON.([%e ident (type_name ~rename typ)]) [%e expr])]
   | _ ->
       Format.eprintf "ZZZ %s@." typ.identifier;
-      assert false
+      [%expr ""]
+
+let compile_pattern ~shapes ~rename ~fields s =
+  compile_string s @@ fun label property greedy ->
+  assert (property = None);
+  let s =
+    convert_to_string ~shapes ~rename ~fields label
+      (ident (field_name label ^ "'"))
+  in
+  if greedy then
+    [%expr
+      String.concat "/"
+        (List.map Uri.pct_encode (String.split_on_char '/' [%e s]))]
+  else [%expr Uri.pct_encode [%e s]]
 
 let compile_rest_json_operation ~service_info ~shapes ~rename nm
     { input; output; errors; _ } traits =
   let http = List.assoc "smithy.api#http" traits in
   let meth = Util.(http |> member "method" |> to_string) in
   let path = Util.(http |> member "uri" |> to_string) in
+  let _code = Util.(http |> member "code" |> to_option to_int) in
+  (*ZZZ  assert (code = None || code = Some 200);*)
   let field_refs name m =
     if name.namespace = "smithy.api" then m
     else
@@ -2344,6 +2388,61 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
       | Structure l, _ -> l
       | _ -> assert false
   in
+  let params, fields' =
+    List.partition
+      (fun (_, _, traits) -> List.mem_assoc "smithy.api#httpQuery" traits)
+      fields
+  in
+  let params =
+    List.fold_left
+      (fun rem ((nm, _, traits) as field) ->
+        let optional = optional_member field in
+        [%expr
+          let params = [%e rem] in
+          [%e
+            let add_param =
+              [%expr
+                ( [%e
+                    B.pexp_constant
+                      (const_string
+                         (Yojson.Safe.Util.to_string
+                            (List.assoc "smithy.api#httpQuery" traits)))],
+                  [
+                    [%e
+                      convert_to_string ~shapes ~rename ~fields nm
+                        (ident (field_name nm ^ "'"))];
+                  ] )
+                :: params]
+            in
+            if optional then
+              [%expr
+                match [%e ident (field_name nm ^ "'")] with
+                | Some [%p B.ppat_var (Location.mknoloc (field_name nm ^ "'"))]
+                  ->
+                    [%e add_param]
+                | None -> params]
+            else add_param]])
+      [%expr []] params
+  in
+  let params', fields' =
+    List.partition
+      (fun (_, _, traits) -> List.mem_assoc "smithy.api#httpQueryParams" traits)
+      fields'
+  in
+  let params =
+    (*ZZZ*)
+    List.fold_left
+      (fun rem (nm, _, _) ->
+        [%expr
+          ignore [%e ident (field_name nm ^ "'")];
+          [%e rem]])
+      params params'
+  in
+  let fields' =
+    List.filter
+      (fun (_, _, traits) -> not (List.mem_assoc "smithy.api#httpLabel" traits))
+      fields'
+  in
   let builder =
     [%expr
       fun k ->
@@ -2364,8 +2463,8 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
                    k
                      (let open! To_JSON in
                      [%e
-                       structure_json_converter ~rename ~fixed_fields:true
-                         (*ZZZ*) fields])
+                       structure_json_converter ~rename ~fixed_fields:false
+                         fields'])
                      [%e
                        match host_prefix with
                        | Some prefix ->
@@ -2374,7 +2473,8 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
                                [%e
                                  compile_pattern ~shapes ~rename ~fields prefix]]
                        | None -> [%expr None]]
-                     [%e compile_pattern ~shapes ~rename ~fields path]]
+                     [%e compile_pattern ~shapes ~rename ~fields path]
+                     [%e params] [] (*ZZZ headers*)]
                  fields)]]
   in
   let errors = service_info.errors @ errors in
@@ -2684,7 +2784,8 @@ module Rules = struct
            (seq [ group (rep any); char '['; group (rep any); char ']' ])))
 
   let compile_string s =
-    compile_string s (fun label property ->
+    compile_string s (fun label property greedy ->
+        assert (not greedy);
         let t = uncapitalized_identifier label in
         let t =
           if t = "endpoint" then [%expr Uri.to_string [%e ident t]] else ident t
