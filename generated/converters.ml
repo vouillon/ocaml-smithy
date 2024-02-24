@@ -181,11 +181,10 @@ let create_JSON_operation ~variant ~target ~builder ~parser ~errors =
 
 let create_rest_json_operation ~method_ ~builder ~parser ~errors =
   (* Use hostname, protocol (https if not set) and path from endpoint *)
-  let headers = [ ("Content-Type", "application/json") ] in
   {
     builder =
       (fun ~test endpoint k ->
-        builder ~test (fun body host_prefix uri query _headers ->
+        builder ~test (fun body host_prefix uri query headers ->
             (*ZZZ*)
             let uri = Uri.of_string uri in
             assert (Uri.host endpoint <> None);
@@ -203,13 +202,13 @@ let create_rest_json_operation ~method_ ~builder ~parser ~errors =
                       (Some
                          (let p = Uri.path endpoint in
                           (if String.ends_with ~suffix:"/" p then
-                           String.sub p 0 (String.length p - 1)
-                          else p)
+                             String.sub p 0 (String.length p - 1)
+                           else p)
                           ^ Uri.path uri))
                     ~query:(Some (Uri.query uri @ query))
                     endpoint;
                 meth = method_;
-                headers = (match body with `Assoc [] -> [] | _ -> headers);
+                headers;
                 body =
                   (match body with
                   | `Assoc [] -> None
@@ -246,9 +245,9 @@ module To_XML = struct
     [
       `Data
         (if x <> x then "NaN"
-        else if 1. /. x <> 0. then Float.to_string x (*ZZZ*)
-        else if x < 0. then "-Infinity"
-        else "Infinity");
+         else if 1. /. x <> 0. then Float.to_string x (*ZZZ*)
+         else if x < 0. then "-Infinity"
+         else "Infinity");
     ]
 
   let timestamp x = [ `Data (Timestamp.to_date_time x) ]
@@ -358,9 +357,9 @@ module To_Graph = struct
     [
       `Data
         (if x <> x then "NaN"
-        else if 1. /. x <> 0. then Float.to_string x (*ZZZ*)
-        else if x < 0. then "-Infinity"
-        else "Infinity");
+         else if 1. /. x <> 0. then Float.to_string x (*ZZZ*)
+         else if x < 0. then "-Infinity"
+         else "Infinity");
     ]
 
   let timestamp x = [ `Data (Timestamp.to_date_time x) ]

@@ -772,14 +772,14 @@ let constructor_parameters ~shapes ~rename ~fields ~body =
           let optional = optional_member field in
           B.pexp_fun
             (if optional then Optional (field_name nm)
-            else Labelled (field_name nm))
+             else Labelled (field_name nm))
             None
             (B.ppat_var (Location.mknoloc (field_name nm)))
             expr)
     fields
     (if has_optionals || fields = [] then
-     B.pexp_fun Nolabel None [%pat? ()] body
-    else body)
+       B.pexp_fun Nolabel None [%pat? ()] body
+     else body)
 
 let print_constructor ~shapes ~rename name fields =
   let body =
@@ -1939,7 +1939,7 @@ let rec compile_value ~shapes ~rename typ v =
           B.pexp_construct
             (Location.mknoloc (Longident.Lident (constr_name nm)))
             (if typ' = unit_type then None
-            else Some (compile_value ~shapes ~rename typ' v'))
+             else Some (compile_value ~shapes ~rename typ' v'))
       | _ -> assert false)
   | List (typ', _) ->
       let sparse =
@@ -2067,7 +2067,7 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                  = Some [%e B.pexp_constant (const_string host)]])
         |> add_test
              (if test.forbid_query_params = [] then None
-             else Some test.forbid_query_params)
+              else Some test.forbid_query_params)
              (fun params ->
                let params =
                  List.fold_right
@@ -2091,7 +2091,7 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                  not fail])
         |> add_test
              (if test.require_query_params = [] then None
-             else Some test.require_query_params)
+              else Some test.require_query_params)
              (fun params ->
                let params =
                  List.fold_right
@@ -2146,7 +2146,7 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                  not fail])
         |> add_test
              (if test.forbid_headers = [] then None
-             else Some test.forbid_headers)
+              else Some test.forbid_headers)
              (fun headers ->
                let headers =
                  List.fold_right
@@ -2162,6 +2162,7 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                      request_headers
                  in
                  if fail then (
+                   Format.eprintf "Forbidden header@.";
                    List.iter
                      (fun (k, v) -> Format.eprintf "%s:%s@." k v)
                      request_headers;
@@ -2169,7 +2170,7 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                  not fail])
         |> add_test
              (if test.require_headers = [] then None
-             else Some test.require_headers)
+              else Some test.require_headers)
              (fun headers ->
                let headers =
                  List.fold_right
@@ -2185,6 +2186,7 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                      headers
                  in
                  if fail then (
+                   Format.eprintf "Missing required header@.";
                    List.iter
                      (fun (k, v) -> Format.eprintf "%s:%s@." k v)
                      request_headers;
@@ -2220,6 +2222,7 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                      headers
                  in
                  if fail then (
+                   Format.eprintf "Header mismatch@.";
                    List.iter
                      (fun (k, v) -> Format.eprintf "%s:%s@." k v)
                      request_headers;
@@ -2351,11 +2354,18 @@ let compile_pattern ~shapes ~rename ~fields s =
 
 let compile_rest_json_operation ~service_info ~shapes ~rename nm
     { input; output; errors; _ } traits =
+  prerr_endline nm.identifier;
   let http = List.assoc "smithy.api#http" traits in
   let meth = Util.(http |> member "method" |> to_string) in
   let path = Util.(http |> member "uri" |> to_string) in
-  let _code = Util.(http |> member "code" |> to_option to_int) in
+  let code = Util.(http |> member "code" |> to_option to_int) in
   (*ZZZ  assert (code = None || code = Some 200);*)
+  ignore code;
+  (*
+  (match code with
+  | Some 200 | None -> ()
+  | Some code -> Format.eprintf "CODE %d@." code);
+*)
   let field_refs name m =
     if name.namespace = "smithy.api" then m
     else
@@ -2368,12 +2378,12 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
   in
   let docs =
     (if input.namespace = "smithy.api" then []
-    else
-      [
-        doc_attr
-          ("See type {!type:" ^ type_name ~rename input
-         ^ "} for a description of the parameters");
-      ])
+     else
+       [
+         doc_attr
+           ("See type {!type:" ^ type_name ~rename input
+          ^ "} for a description of the parameters");
+       ])
     @ documentation ~shapes
         ~field_refs:(StringMap.empty |> field_refs output |> field_refs input)
         traits
@@ -2441,11 +2451,63 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
           [%e rem]])
       params params'
   in
+  let headers, fields' =
+    List.partition
+      (fun (_, _, traits) -> List.mem_assoc "smithy.api#httpHeader" traits)
+      fields'
+  in
+  let headers =
+    List.fold_left
+      (fun rem ((nm, _, traits) as field) ->
+        let optional = optional_member field in
+        [%expr
+          let headers = [%e rem] in
+          [%e
+            let add_header =
+              [%expr
+                ( [%e
+                    B.pexp_constant
+                      (const_string
+                         (Yojson.Safe.Util.to_string
+                            (List.assoc "smithy.api#httpHeader" traits)))],
+                  [%e
+                    convert_to_string ~shapes ~rename ~fields nm
+                      (ident (field_name nm ^ "'"))] )
+                :: headers]
+            in
+            if optional then
+              [%expr
+                match [%e ident (field_name nm ^ "'")] with
+                | Some [%p B.ppat_var (Location.mknoloc (field_name nm ^ "'"))]
+                  ->
+                    [%e add_header]
+                | None -> headers]
+            else add_header]])
+      [%expr []] headers
+  in
+  let headers', fields' =
+    List.partition
+      (fun (_, _, traits) ->
+        List.mem_assoc "smithy.api#httpHeaderPrefix" traits)
+      fields'
+  in
+  let headers =
+    (*ZZZ*)
+    List.fold_left
+      (fun rem (nm, _, _) ->
+        [%expr
+          ignore [%e ident (field_name nm ^ "'")];
+          [%e rem]])
+      headers headers'
+  in
   let fields' =
     List.filter
       (fun (_, _, traits) -> not (List.mem_assoc "smithy.api#httpLabel" traits))
       fields'
   in
+  let headers = [%expr ("Content-Type", "application/json") :: [%e headers]] in
+  Format.eprintf "ZZZZZ %d@." (List.length fields');
+  (*ZZZ*)
   let builder =
     [%expr
       fun ~test:_ (*ZZZ idempotency token*) k ->
@@ -2465,9 +2527,9 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
                  [%expr
                    k
                      (let open! To_JSON in
-                     [%e
-                       structure_json_converter ~rename ~fixed_fields:false
-                         fields'])
+                      [%e
+                        structure_json_converter ~rename ~fixed_fields:false
+                          fields'])
                      [%e
                        match host_prefix with
                        | Some prefix ->
@@ -2477,7 +2539,7 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
                                  compile_pattern ~shapes ~rename ~fields prefix]]
                        | None -> [%expr None]]
                      [%e compile_pattern ~shapes ~rename ~fields path]
-                     [%e params] [] (*ZZZ headers*)]
+                     [%e params] [%e headers]]
                  fields)]]
   in
   let errors = service_info.errors @ errors in
@@ -2522,13 +2584,13 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
                        B.pexp_ident
                          (Location.mknoloc
                             (if output.namespace = "smithy.api" then
-                             Longident.(
-                               Ldot
-                                 ( Ldot (Lident "Converters", "From_JSON"),
-                                   type_name ~rename output ))
-                            else
-                              Longident.Ldot
-                                (Lident "From_JSON", type_name ~rename output)))]
+                               Longident.(
+                                 Ldot
+                                   ( Ldot (Lident "Converters", "From_JSON"),
+                                     type_name ~rename output ))
+                             else
+                               Longident.Ldot
+                                 (Lident "From_JSON", type_name ~rename output)))]
                    ~errors:[%e errors]])
         with
         pvb_attributes = docs;
@@ -2549,12 +2611,12 @@ let compile_json_operation ~service_id ~service_info ~protocol ~shapes ~rename
   in
   let docs =
     (if input.namespace = "smithy.api" then []
-    else
-      [
-        doc_attr
-          ("See type {!type:" ^ type_name ~rename input
-         ^ "} for a description of the parameters");
-      ])
+     else
+       [
+         doc_attr
+           ("See type {!type:" ^ type_name ~rename input
+          ^ "} for a description of the parameters");
+       ])
     @ documentation ~shapes
         ~field_refs:(StringMap.empty |> field_refs output |> field_refs input)
         traits
@@ -2591,9 +2653,9 @@ let compile_json_operation ~service_id ~service_info ~protocol ~shapes ~rename
                  [%expr
                    k
                      (let open! To_JSON in
-                     [%e
-                       structure_json_converter ~rename ~fixed_fields:true
-                         (*ZZZ*) fields])
+                      [%e
+                        structure_json_converter ~rename ~fixed_fields:true
+                          (*ZZZ*) fields])
                      [%e
                        match host_prefix with
                        | Some prefix ->
@@ -2650,13 +2712,13 @@ let compile_json_operation ~service_id ~service_info ~protocol ~shapes ~rename
                        B.pexp_ident
                          (Location.mknoloc
                             (if output.namespace = "smithy.api" then
-                             Longident.(
-                               Ldot
-                                 ( Ldot (Lident "Converters", "From_JSON"),
-                                   type_name ~rename output ))
-                            else
-                              Longident.Ldot
-                                (Lident "From_JSON", type_name ~rename output)))]
+                               Longident.(
+                                 Ldot
+                                   ( Ldot (Lident "Converters", "From_JSON"),
+                                     type_name ~rename output ))
+                             else
+                               Longident.Ldot
+                                 (Lident "From_JSON", type_name ~rename output)))]
                    ~errors:[%e errors]])
         with
         pvb_attributes = docs;
@@ -3028,7 +3090,7 @@ module Rules = struct
         let p = uncapitalized_identifier p in
         B.pexp_fun
           (if (*p = "region" ||*) required && default = None then Labelled p
-          else Optional p)
+           else Optional p)
           (Option.map
              (fun b -> if b then [%expr true] else [%expr false])
              default)
@@ -3122,7 +3184,7 @@ let compile_service shs service =
       :: types
       ::
       (if record_constructors = [] then []
-      else [ B.pstr_attribute (text_attr "{1 Record constructors}") ])
+       else [ B.pstr_attribute (text_attr "{1 Record constructors}") ])
     @ record_constructors @ toggle_hide @ endpoint @ converters @ converters'
     @ toggle_hide
     @ (B.pstr_attribute (text_attr "{1 Operations}") :: operations));
@@ -3139,10 +3201,9 @@ let compile dir f =
 let () =
   let _f { namespace = _; identifier = _ } = () in
   (*
-
-  let dir = "." in
-  *)
   let dir = "/home/jerome/sources/aws-sdk-rust/aws-models" in
+  *)
+  let dir = "." in
   if true then
     let files = Array.to_list (Sys.readdir dir) in
     let files =
