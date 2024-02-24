@@ -446,7 +446,7 @@ let type_of_shape shapes nm =
     | "String" -> String
     | "Float" -> Float
     | "Double" -> Double
-    | "Boolean" -> Boolean
+    | "Boolean" | "PrimitiveBoolean" -> Boolean
     | "Short" -> Short
     | "Byte" -> Byte
     | "Blob" -> Blob
@@ -2010,7 +2010,7 @@ let compile_parameters ~shapes ~rename typ v =
             pl
         in
         List.map
-          (fun (k, v) -> (Asttypes.Labelled (uncapitalized_identifier k), v))
+          (fun (k, v) -> (Ppxlib.Ast.Labelled (uncapitalized_identifier k), v))
           pl
     | _ -> assert false
 
@@ -2026,21 +2026,22 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
         [%e
           B.pexp_apply
             [%expr ([%e ident (type_name ~rename op_name)] ()).builder]
-            (( Asttypes.Nolabel,
-               [%expr
-                 Uri.of_string
-                   [%e
-                     B.pexp_constant
-                       (const_string
-                          (match test.host with
-                          | Some host ->
-                              (* Trailing slashes are optional, and the
-                                 tests expect them. *)
-                              "https://"
-                              ^
-                              if String.ends_with host ~suffix:"/" then host
-                              else host ^ "/"
-                          | None -> "https://unknownhost.com/"))]] )
+            ((Ppxlib.Ast.Labelled "test", [%expr true])
+             :: ( Nolabel,
+                  [%expr
+                    Uri.of_string
+                      [%e
+                        B.pexp_constant
+                          (const_string
+                             (match test.host with
+                             | Some host ->
+                                 (* Trailing slashes are optional, and the
+                                    tests expect them. *)
+                                 "https://"
+                                 ^
+                                 if String.ends_with host ~suffix:"/" then host
+                                 else host ^ "/"
+                             | None -> "https://unknownhost.com/"))]] )
              :: (Nolabel, [%expr fun x -> x])
              :: compile_parameters ~shapes ~rename input test.params
             @ if has_optionals then [ (Nolabel, [%expr ()]) ] else [])]
@@ -2331,7 +2332,9 @@ let convert_to_string ~shapes ~rename ~fields nm expr =
           (To_JSON.([%e ident (type_name ~rename typ)]) [%e expr])]
   | _ ->
       Format.eprintf "ZZZ %s@." typ.identifier;
-      [%expr ""]
+      [%expr
+        ignore [%e expr];
+        ""]
 
 let compile_pattern ~shapes ~rename ~fields s =
   compile_string s @@ fun label property greedy ->
@@ -2445,7 +2448,7 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
   in
   let builder =
     [%expr
-      fun k ->
+      fun ~test:_ (*ZZZ idempotency token*) k ->
         [%e
           constructor_parameters ~shapes ~rename ~fields
             ~body:
@@ -2571,7 +2574,7 @@ let compile_json_operation ~service_id ~service_info ~protocol ~shapes ~rename
   in
   let builder =
     [%expr
-      fun k ->
+      fun ~test:_ (*ZZZ idempotency token*) k ->
         [%e
           constructor_parameters ~shapes ~rename ~fields
             ~body:
@@ -3136,9 +3139,10 @@ let compile dir f =
 let () =
   let _f { namespace = _; identifier = _ } = () in
   (*
-  let dir = "/home/jerome/sources/aws-sdk-rust/aws-models" in
-  *)
+
   let dir = "." in
+  *)
+  let dir = "/home/jerome/sources/aws-sdk-rust/aws-models" in
   if true then
     let files = Array.to_list (Sys.readdir dir) in
     let files =

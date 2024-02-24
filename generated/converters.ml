@@ -130,7 +130,7 @@ type request = {
 type response = { code : int; headers : (string * string) list; body : string }
 
 type (+'perform, -'result, +'response, +'error) operation = {
-  builder : Uri.t -> (request -> 'result) -> 'perform;
+  builder : test:bool -> Uri.t -> (request -> 'result) -> 'perform;
   parser : response -> ('response, 'error) Result.t;
 }
 
@@ -150,8 +150,8 @@ let create_JSON_operation ~variant ~target ~builder ~parser ~errors =
   in
   {
     builder =
-      (fun endpoint k ->
-        builder (fun body host_prefix ->
+      (fun ~test endpoint k ->
+        builder ~test (fun body host_prefix ->
             (*ZZZ*)
             assert (Uri.host endpoint <> None);
             k
@@ -184,8 +184,8 @@ let create_rest_json_operation ~method_ ~builder ~parser ~errors =
   let headers = [ ("Content-Type", "application/json") ] in
   {
     builder =
-      (fun endpoint k ->
-        builder (fun body host_prefix uri query _headers ->
+      (fun ~test endpoint k ->
+        builder ~test (fun body host_prefix uri query _headers ->
             (*ZZZ*)
             let uri = Uri.of_string uri in
             assert (Uri.host endpoint <> None);
