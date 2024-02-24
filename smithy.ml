@@ -2505,10 +2505,81 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
       (fun (_, _, traits) -> not (List.mem_assoc "smithy.api#httpLabel" traits))
       fields'
   in
-  let headers = [%expr ("Content-Type", "application/json") :: [%e headers]] in
   Format.eprintf "ZZZZZ %d@." (List.length fields');
   (*ZZZ*)
   let builder =
+    let add_content_type typ headers =
+      [%expr
+        ("Content-Type", [%e B.pexp_constant (const_string typ)])
+        :: [%e headers]]
+    in
+    let body, headers =
+      match fields' with
+      | [] -> ([%expr None], headers)
+      | [ ((nm, typ, traits) as field) ]
+        when List.mem_assoc "smithy.api#httpPayload" traits ->
+          let value = ident (field_name nm ^ "'") in
+          let convert, headers' =
+            match type_of_shape shapes typ with
+            | Blob ->
+                ( [%expr Some [%e value]],
+                  add_content_type "application/octet-stream" [%expr headers] )
+            | String ->
+                ( [%expr Some [%e value]],
+                  add_content_type "text/plain" [%expr headers] )
+            | Enum _ ->
+                ( [%expr
+                    Some
+                      (Yojson.Safe.Util.to_string
+                         (To_JSON.([%e ident (type_name ~rename typ)])
+                            [%e value]))],
+                  add_content_type "text/plain" [%expr headers] )
+            | Document ->
+                ( [%expr Some (Yojson.Safe.to_string [%e value])],
+                  add_content_type "application/json" [%expr headers] )
+            | Union _ | Structure _ ->
+                ( [%expr
+                    Some
+                      (Yojson.Safe.to_string
+                         (let open To_JSON in
+                          [%e
+                            let path =
+                              Longident.(Ldot (Lident "Converters", "To_JSON"))
+                            in
+                            converter ~rename ~path ~sparse:false typ]
+                            [%e value]))],
+                  add_content_type "application/json" [%expr headers] )
+            | _ -> assert false
+          in
+          if optional_member field then
+            ( [%expr
+                match [%e value] with
+                | None -> None
+                | Some [%p B.ppat_var (Location.mknoloc (field_name nm ^ "'"))]
+                  ->
+                    [%e convert]],
+              [%expr
+                let headers = [%e headers] in
+                match [%e value] with
+                | None -> headers
+                | Some [%p B.ppat_var (Location.mknoloc (field_name nm ^ "'"))]
+                  ->
+                    [%e headers']] )
+          else
+            ( convert,
+              [%expr
+                let headers = [%e headers] in
+                [%e headers']] )
+      | _ ->
+          ( [%expr
+              Some
+                (Yojson.Safe.to_string
+                   (let open! To_JSON in
+                    [%e
+                      structure_json_converter ~rename ~fixed_fields:false
+                        fields']))],
+            add_content_type "application/json" headers )
+    in
     [%expr
       fun ~test:_ (*ZZZ idempotency token*) k ->
         [%e
@@ -2525,11 +2596,7 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
                      ]
                      expr)
                  [%expr
-                   k
-                     (let open! To_JSON in
-                      [%e
-                        structure_json_converter ~rename ~fixed_fields:false
-                          fields'])
+                   k [%e body]
                      [%e
                        match host_prefix with
                        | Some prefix ->
@@ -3200,10 +3267,10 @@ let compile dir f =
 
 let () =
   let _f { namespace = _; identifier = _ } = () in
-  (*
   let dir = "/home/jerome/sources/aws-sdk-rust/aws-models" in
-  *)
+  (*
   let dir = "." in
+  *)
   if true then
     let files = Array.to_list (Sys.readdir dir) in
     let files =

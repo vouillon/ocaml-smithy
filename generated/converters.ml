@@ -209,10 +209,7 @@ let create_rest_json_operation ~method_ ~builder ~parser ~errors =
                     endpoint;
                 meth = method_;
                 headers;
-                body =
-                  (match body with
-                  | `Assoc [] -> None
-                  | _ -> Some (Yojson.Safe.to_string body));
+                body;
               }));
     parser =
       (fun response ->
