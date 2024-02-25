@@ -2520,13 +2520,25 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
         when List.mem_assoc "smithy.api#httpPayload" traits ->
           let value = ident (field_name nm ^ "'") in
           let convert, headers' =
+            let content_type ~default =
+              Option.value ~default
+                (match IdMap.find_opt typ shapes with
+                | None -> None
+                | Some (_, traits) ->
+                    Option.map Yojson.Safe.Util.to_string
+                      (List.assoc_opt "smithy.api#mediaType" traits))
+            in
             match type_of_shape shapes typ with
             | Blob ->
                 ( [%expr Some [%e value]],
-                  add_content_type "application/octet-stream" [%expr headers] )
+                  add_content_type
+                    (content_type ~default:"application/octet-stream")
+                    [%expr headers] )
             | String ->
                 ( [%expr Some [%e value]],
-                  add_content_type "text/plain" [%expr headers] )
+                  add_content_type
+                    (content_type ~default:"text/plain")
+                    [%expr headers] )
             | Enum _ ->
                 ( [%expr
                     Some
@@ -2580,6 +2592,17 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
                         fields']))],
             add_content_type "application/json" headers )
     in
+    let headers =
+      if List.mem_assoc "smithy.api#httpChecksumRequired" traits then
+        [%expr
+          let headers = [%e headers] in
+          match body with
+          | Some body ->
+              ("Content-MD5", Base64.encode_string (Digest.string body))
+              :: headers
+          | None -> headers]
+      else headers
+    in
     [%expr
       fun ~test:_ (*ZZZ idempotency token*) k ->
         [%e
@@ -2596,7 +2619,8 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
                      ]
                      expr)
                  [%expr
-                   k [%e body]
+                   let body : _ option = [%e body] in
+                   k body
                      [%e
                        match host_prefix with
                        | Some prefix ->
@@ -3267,10 +3291,10 @@ let compile dir f =
 
 let () =
   let _f { namespace = _; identifier = _ } = () in
-  let dir = "/home/jerome/sources/aws-sdk-rust/aws-models" in
   (*
-  let dir = "." in
+  let dir = "/home/jerome/sources/aws-sdk-rust/aws-models" in
   *)
+  let dir = "." in
   if true then
     let files = Array.to_list (Sys.readdir dir) in
     let files =

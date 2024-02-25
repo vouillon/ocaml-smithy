@@ -32,7 +32,7 @@ module To_String = struct
     else if x < 0. then "-Infinity"
     else "Infinity"
 
-  let timestamp x = Printf.sprintf "%.0f" (Timestamp.to_epoch_seconds x)
+  let timestamp = Timestamp.to_date_time
 end
 
 module To_JSON = struct
