@@ -1,4 +1,6 @@
 (*
+Mixins
+
 TODO
 - generate operations for all protocols
 - sign and perform requests
@@ -415,7 +417,7 @@ let type_name ~rename id =
       | "Integer" -> "int"
       | "Long" | "PrimitiveLong" -> "Int64.t"
       | "Float" | "Double" -> "float"
-      | "Timestamp" -> "CalendarLib.Calendar.t"
+      | "Timestamp" -> "Ptime.t"
       | "Document" -> "Yojson.Safe.t"
       | "Unit" -> "unit"
       | "Short" -> "int"
@@ -858,7 +860,7 @@ let print_type ?heading ~inputs ~shapes ~rename (nm, (sh, traits)) =
     | Long -> manifest_type [%type: Int64.t]
     | Float | Double -> manifest_type [%type: float]
     | Byte -> manifest_type [%type: char]
-    | Timestamp -> manifest_type [%type: CalendarLib.Calendar.t]
+    | Timestamp -> manifest_type [%type: Ptime.t]
     | Document -> manifest_type [%type: Yojson.Safe.t]
     | List (id, _) ->
         let sparse = List.mem_assoc "smithy.api#sparse" traits in
@@ -1024,7 +1026,18 @@ let to_json ~rename ~fixed_fields (name, (sh, traits)) =
             | Long -> [%expr Converters.To_JSON.long [%e ident nm]]
             | Float | Double -> [%expr Converters.To_JSON.float [%e ident nm]]
             | Byte -> [%expr Converters.To_JSON.byte [%e ident nm]]
-            | Timestamp -> [%expr Converters.To_JSON.timestamp [%e ident nm]]
+            | Timestamp -> (
+                match
+                  Option.map Yojson.Safe.Util.to_string
+                    (List.assoc_opt "smithy.api#timestampFormat" traits)
+                with
+                | None | Some "epoch-seconds" ->
+                    [%expr Converters.To_JSON.timestamp [%e ident nm]]
+                | Some format ->
+                    let format = capitalized_identifier format in
+                    [%expr
+                      Converters.To_JSON.timestamp
+                        ~format:[%e B.pexp_variant format None] [%e ident nm]])
             | Document -> [%expr Converters.To_JSON.document [%e ident nm]]
             | List (id, _) ->
                 let sparse = List.mem_assoc "smithy.api#sparse" traits in
@@ -1495,7 +1508,18 @@ let from_json ~rename ~fixed_fields (name, (sh, traits)) =
             | Long -> [%expr Converters.From_JSON.long [%e ident nm]]
             | Float | Double -> [%expr Converters.From_JSON.float [%e ident nm]]
             | Byte -> [%expr Converters.From_JSON.byte [%e ident nm]]
-            | Timestamp -> [%expr Converters.From_JSON.timestamp [%e ident nm]]
+            | Timestamp -> (
+                match
+                  Option.map Yojson.Safe.Util.to_string
+                    (List.assoc_opt "smithy.api#timestampFormat" traits)
+                with
+                | None | Some "epoch-seconds" ->
+                    [%expr Converters.From_JSON.timestamp [%e ident nm]]
+                | Some format ->
+                    let format = capitalized_identifier format in
+                    [%expr
+                      Converters.From_JSON.timestamp
+                        ~format:[%e B.pexp_variant format None] [%e ident nm]])
             | Document -> [%expr Converters.From_JSON.document [%e ident nm]]
             | List (id, _) ->
                 let sparse = List.mem_assoc "smithy.api#sparse" traits in
@@ -1908,10 +1932,11 @@ let rec compile_value ~shapes ~rename typ v =
           [%e B.pexp_constant (const_string (Yojson.Safe.to_string v))]]
   | Timestamp ->
       [%expr
-        CalendarLib.Calendar.from_unixfloat
-          [%e
-            B.pexp_constant
-              (Pconst_float (Printf.sprintf "%h" (Util.to_number v), None))]]
+        Option.get
+          (Ptime.of_float_s
+             [%e
+               B.pexp_constant
+                 (Pconst_float (Printf.sprintf "%h" (Util.to_number v), None))])]
   | Structure [] -> [%expr ()]
   | Structure l ->
       B.pexp_record
@@ -2319,8 +2344,23 @@ let compile_http_response_tests ~shapes ~rename ~output op_name
   in
   [%stri let%test [%p B.ppat_constant (const_string test.id)] = [%e t]]
 
-let convert_to_string ~shapes ~rename ~fields nm expr =
-  let _, typ, _ = List.find (fun (nm', _, _) -> nm' = nm) fields in
+let timestamp_format ~shapes ~traits ~typ ~default_format ~default =
+  let format =
+    match List.assoc_opt "smithy.api#timestampFormat" traits with
+    | Some format -> Some format
+    | None ->
+        Option.bind (IdMap.find_opt typ shapes) @@ fun (_, traits) ->
+        List.assoc_opt "smithy.api#timestampFormat" traits
+  in
+  let format =
+    Option.value ~default:default_format
+      (Option.map Yojson.Safe.Util.to_string format)
+  in
+  if format = default then None else Some (capitalized_identifier format)
+
+let convert_to_string ~shapes ~rename ~fields ?(default_format = "date-time") nm
+    expr =
+  let _, typ, traits = List.find (fun (nm', _, _) -> nm' = nm) fields in
   match type_of_shape shapes typ with
   | String -> expr
   | Boolean -> [%expr Converters.To_String.boolean [%e expr]]
@@ -2328,7 +2368,17 @@ let convert_to_string ~shapes ~rename ~fields nm expr =
   | Long -> [%expr Converters.To_String.long [%e expr]]
   | Byte -> [%expr Converters.To_String.byte [%e expr]]
   | Float | Double -> [%expr Converters.To_String.float [%e expr]]
-  | Timestamp -> [%expr Converters.To_String.timestamp [%e expr]]
+  | Timestamp -> (
+      let format =
+        timestamp_format ~shapes ~traits ~typ ~default_format
+          ~default:"date-time"
+      in
+      match format with
+      | None -> [%expr Converters.To_String.timestamp [%e expr]]
+      | Some format ->
+          [%expr
+            Converters.To_String.timestamp
+              ~format:[%e B.pexp_variant format None] [%e expr]])
   | Enum _ ->
       [%expr
         Yojson.Safe.Util.to_string
@@ -2471,7 +2521,8 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
                          (Yojson.Safe.Util.to_string
                             (List.assoc "smithy.api#httpHeader" traits)))],
                   [%e
-                    convert_to_string ~shapes ~rename ~fields nm
+                    convert_to_string ~shapes ~rename ~fields
+                      ~default_format:"http-date" nm
                       (ident (field_name nm ^ "'"))] )
                 :: headers]
             in

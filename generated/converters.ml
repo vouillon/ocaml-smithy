@@ -5,15 +5,28 @@ module StringMap = Map.Make (struct
 end)
 
 module Timestamp = struct
-  let to_date_time t = CalendarLib.Printer.Calendar.sprint "%FT%RZ" t
-  let time_secfrac_re = Re.(compile (seq [ char '.'; rep (rg '0' '9') ]))
+  let to_date_time t =
+    if Ptime.truncate ~frac_s:0 t = t then
+      Ptime.to_rfc3339 ~frac_s:0 ~tz_offset_s:0 t
+    else Ptime.to_rfc3339 ~frac_s:3 ~tz_offset_s:0 t
 
   let from_date_time t =
-    CalendarLib.Printer.CalendarPrinter.from_fstring "%FT%TZ"
-      (Re.replace_string time_secfrac_re ~by:"" t)
+    let t, _, _ = Result.get_ok (Ptime.of_rfc3339 t) in
+    t
 
-  let to_epoch_seconds = CalendarLib.Calendar.to_unixfloat
-  let from_epoch_seconds = CalendarLib.Calendar.from_unixfloat
+  let to_epoch_seconds t = Ptime.to_float_s t
+  let from_epoch_seconds t = Option.get (Ptime.of_float_s t)
+  let to_http_date = Http_date.encode
+  let from_http_date = Http_date.decode
+
+  let to_string ~format t =
+    match format with
+    | `Date_time -> to_date_time t
+    | `Epoch_seconds ->
+        if Ptime.truncate ~frac_s:0 t = t then
+          Printf.sprintf "%.0f" (to_epoch_seconds t)
+        else Printf.sprintf "%.3f" (to_epoch_seconds t)
+    | `Http_date -> to_http_date t
 end
 
 module To_String = struct
@@ -32,7 +45,7 @@ module To_String = struct
     else if x < 0. then "-Infinity"
     else "Infinity"
 
-  let timestamp = Timestamp.to_date_time
+  let timestamp ?(format = `Date_time) t = Timestamp.to_string ~format t
 end
 
 module To_JSON = struct
@@ -52,8 +65,14 @@ module To_JSON = struct
     else if 1. /. x <> 0. then `Float x
     else `String (if x < 0. then "-Infinity" else "Infinity")
 
-  let timestamp x =
-    `Intlit (Printf.sprintf "%.0f" (Timestamp.to_epoch_seconds x))
+  let timestamp ?(format = `Epoch_seconds) x =
+    match format with
+    | `Epoch_seconds ->
+        if Ptime.truncate ~frac_s:0 x = x then
+          `Intlit (Printf.sprintf "%.0f" (Timestamp.to_epoch_seconds x))
+        else `Float (Timestamp.to_epoch_seconds x)
+    | `Date_time -> `String (Timestamp.to_date_time x)
+    | `Http_date -> `String (Timestamp.to_http_date x)
 
   let document x = x
   let option f x = match x with None -> `Null | Some x -> f x
@@ -93,7 +112,12 @@ module From_JSON = struct
     | `Intlit x -> float_of_string x
     | _ -> assert false
 
-  let timestamp x = Timestamp.from_epoch_seconds (to_number x)
+  let timestamp ?(format = `Epoch_seconds) x =
+    match format with
+    | `Epoch_seconds -> Timestamp.from_epoch_seconds (to_number x)
+    | `Date_time -> Timestamp.from_date_time (to_string x)
+    | `Http_date -> Timestamp.from_http_date (to_string x)
+
   let document x = x
   let option f x = if x = `Null then None else Some (f x)
   let list f x = List.map f (to_list x)
