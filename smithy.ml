@@ -1028,7 +1028,7 @@ let print_types ~rename ~inputs ~outputs ~operations shapes =
 
 let ident id = B.pexp_ident (Location.mknoloc (Longident.Lident id))
 
-let converter ~rename ~path ~sparse id =
+let converter ~rename ~path ~sparse ?timestamp_format id =
   let convert id =
     match id.namespace with
     | "smithy.api" ->
@@ -1050,6 +1050,14 @@ let converter ~rename ~path ~sparse id =
                   | _ -> assert false )))
     | _ -> ident (type_name ~rename id)
   in
+  let convert id =
+    match timestamp_format with
+    | None -> convert id
+    | Some format ->
+        [%expr
+          [%e convert id]
+            ~format:[%e B.pexp_variant (capitalized_identifier format) None]]
+  in
   if sparse then
     [%expr
       [%e B.pexp_ident (Location.mknoloc (Longident.Ldot (path, "option")))]
@@ -1065,14 +1073,22 @@ let structure_json_converter ~rename ~fixed_fields:fixed fields =
     Converters.To_JSON.structure
       [%e
         List.fold_right
-          (fun ((nm, typ, _) as field) lst ->
+          (fun ((nm, typ, traits) as field) lst ->
             let optional = optional_member field in
             [%expr
               ( [%e B.pexp_constant (const_string (member_name ~fixed field))],
-                [%e converter ~rename ~path ~sparse:optional typ]
+                [%e
+                  converter ~rename ~path ~sparse:optional
+                    ?timestamp_format:
+                      (Option.map Yojson.Safe.Util.to_string
+                         (List.assoc_opt "smithy.api#timestampFormat" traits))
+                    typ]
                   [%e ident (field_name nm ^ "'")] )
               :: [%e lst]])
           fields [%expr []]]]
+
+let add_timestamp_parameter ~typ expr =
+  match typ with Timestamp -> [%expr fun ?format -> [%e expr]] | _ -> expr
 
 let to_json ~rename ~fixed_fields (name, { typ; traits; _ }) =
   let path = Longident.(Ldot (Lident "Converters", "To_JSON")) in
@@ -1080,117 +1096,123 @@ let to_json ~rename ~fixed_fields (name, { typ; traits; _ }) =
   B.value_binding
     ~pat:(B.ppat_var (Location.mknoloc (type_name ~rename name)))
     ~expr:
-      (B.pexp_fun Nolabel None
-         [%pat?
-           ([%p B.ppat_var (Location.mknoloc nm)] :
-             [%t type_ident ~rename name])]
-         (B.pexp_constraint
-            (match typ with
-            | Blob -> [%expr Converters.To_JSON.blob [%e ident nm]]
-            | Boolean -> [%expr Converters.To_JSON.boolean [%e ident nm]]
-            | String -> [%expr Converters.To_JSON.string [%e ident nm]]
-            | Enum l ->
-                [%expr
-                  Converters.To_JSON.string
-                    [%e
-                      B.pexp_match (ident nm)
-                        (List.map
-                           (fun ((nm, _, _) as enum) ->
-                             B.case ~lhs:(pat_construct nm None) ~guard:None
-                               ~rhs:
-                                 (B.pexp_constant
-                                    (const_string
-                                       (member_name ~fixed:false
-                                          ~name:"smithy.api#enumValue" enum))))
-                           l)]]
-            | Integer | IntEnum | Short ->
-                [%expr Converters.To_JSON.integer [%e ident nm]]
-            | Long -> [%expr Converters.To_JSON.long [%e ident nm]]
-            | Float | Double -> [%expr Converters.To_JSON.float [%e ident nm]]
-            | Byte -> [%expr Converters.To_JSON.byte [%e ident nm]]
-            | Timestamp -> (
-                match
-                  Option.map Yojson.Safe.Util.to_string
-                    (List.assoc_opt "smithy.api#timestampFormat" traits)
-                with
-                | None | Some "epoch-seconds" ->
-                    [%expr Converters.To_JSON.timestamp [%e ident nm]]
-                | Some format ->
-                    let format = capitalized_identifier format in
-                    [%expr
-                      Converters.To_JSON.timestamp
-                        ~format:[%e B.pexp_variant format None] [%e ident nm]])
-            | Document -> [%expr Converters.To_JSON.document [%e ident nm]]
-            | List (id, _) ->
-                let sparse = List.mem_assoc "smithy.api#sparse" traits in
-                [%expr
-                  Converters.To_JSON.list
-                    [%e converter ~rename ~path ~sparse id]
-                    [%e ident nm]]
-            | Map (_key, (value, _)) ->
-                let sparse = List.mem_assoc "smithy.api#sparse" traits in
-                [%expr
-                  Converters.To_JSON.map
-                    [%e converter ~rename ~path ~sparse value]
-                    [%e ident nm]]
-            | Structure [] -> [%expr Converters.To_JSON.structure []]
-            | Structure l ->
-                B.pexp_match (ident nm)
-                  [
-                    B.case
-                      ~lhs:
-                        (B.ppat_record
-                           (List.map
-                              (fun (nm, _, _) ->
-                                ( Location.mknoloc
-                                    (Longident.Lident (field_name nm)),
-                                  B.ppat_var
-                                    (Location.mknoloc (field_name nm ^ "'")) ))
-                              l)
-                           Closed)
-                      ~guard:None
-                      ~rhs:(structure_json_converter ~rename ~fixed_fields l);
-                  ]
-            | Union l ->
-                [%expr
-                  Converters.To_JSON.structure
-                    [
+      (add_timestamp_parameter ~typ
+      @@ B.pexp_fun Nolabel None
+           [%pat?
+             ([%p B.ppat_var (Location.mknoloc nm)] :
+               [%t type_ident ~rename name])]
+           (B.pexp_constraint
+              (match typ with
+              | Blob -> [%expr Converters.To_JSON.blob [%e ident nm]]
+              | Boolean -> [%expr Converters.To_JSON.boolean [%e ident nm]]
+              | String -> [%expr Converters.To_JSON.string [%e ident nm]]
+              | Enum l ->
+                  [%expr
+                    Converters.To_JSON.string
                       [%e
                         B.pexp_match (ident nm)
                           (List.map
-                             (fun ((nm, typ, _) as constr) ->
-                               if typ = unit_type then
-                                 B.case ~lhs:(pat_construct nm None) ~guard:None
-                                   ~rhs:
-                                     [%expr
-                                       [%e
-                                         B.pexp_constant
-                                           (const_string
-                                              (member_name ~fixed:fixed_fields
-                                                 constr))],
+                             (fun ((nm, _, _) as enum) ->
+                               B.case ~lhs:(pat_construct nm None) ~guard:None
+                                 ~rhs:
+                                   (B.pexp_constant
+                                      (const_string
+                                         (member_name ~fixed:false
+                                            ~name:"smithy.api#enumValue" enum))))
+                             l)]]
+              | Integer | IntEnum | Short ->
+                  [%expr Converters.To_JSON.integer [%e ident nm]]
+              | Long -> [%expr Converters.To_JSON.long [%e ident nm]]
+              | Float | Double -> [%expr Converters.To_JSON.float [%e ident nm]]
+              | Byte -> [%expr Converters.To_JSON.byte [%e ident nm]]
+              | Timestamp -> (
+                  match
+                    Option.map Yojson.Safe.Util.to_string
+                      (List.assoc_opt "smithy.api#timestampFormat" traits)
+                  with
+                  | None | Some "epoch-seconds" ->
+                      [%expr Converters.To_JSON.timestamp ?format [%e ident nm]]
+                  | Some format ->
+                      let format = capitalized_identifier format in
+                      [%expr
+                        Converters.To_JSON.timestamp
+                          ~format:
+                            (Option.value
+                               ~default:[%e B.pexp_variant format None] format)
+                          [%e ident nm]])
+              | Document -> [%expr Converters.To_JSON.document [%e ident nm]]
+              | List (id, _) ->
+                  let sparse = List.mem_assoc "smithy.api#sparse" traits in
+                  [%expr
+                    Converters.To_JSON.list
+                      [%e converter ~rename ~path ~sparse id]
+                      [%e ident nm]]
+              | Map (_key, (value, _)) ->
+                  let sparse = List.mem_assoc "smithy.api#sparse" traits in
+                  [%expr
+                    Converters.To_JSON.map
+                      [%e converter ~rename ~path ~sparse value]
+                      [%e ident nm]]
+              | Structure [] -> [%expr Converters.To_JSON.structure []]
+              | Structure l ->
+                  B.pexp_match (ident nm)
+                    [
+                      B.case
+                        ~lhs:
+                          (B.ppat_record
+                             (List.map
+                                (fun (nm, _, _) ->
+                                  ( Location.mknoloc
+                                      (Longident.Lident (field_name nm)),
+                                    B.ppat_var
+                                      (Location.mknoloc (field_name nm ^ "'"))
+                                  ))
+                                l)
+                             Closed)
+                        ~guard:None
+                        ~rhs:(structure_json_converter ~rename ~fixed_fields l);
+                    ]
+              | Union l ->
+                  [%expr
+                    Converters.To_JSON.structure
+                      [
+                        [%e
+                          B.pexp_match (ident nm)
+                            (List.map
+                               (fun ((nm, typ, _) as constr) ->
+                                 if typ = unit_type then
+                                   B.case ~lhs:(pat_construct nm None)
+                                     ~guard:None
+                                     ~rhs:
+                                       [%expr
                                          [%e
-                                           structure_json_converter ~rename
-                                             ~fixed_fields []]]
-                               else
-                                 B.case
-                                   ~lhs:(pat_construct nm (Some [%pat? x]))
-                                   ~guard:None
-                                   ~rhs:
-                                     [%expr
-                                       [%e
-                                         B.pexp_constant
-                                           (const_string
-                                              (member_name ~fixed:fixed_fields
-                                                 constr))],
+                                           B.pexp_constant
+                                             (const_string
+                                                (member_name ~fixed:fixed_fields
+                                                   constr))],
+                                           [%e
+                                             structure_json_converter ~rename
+                                               ~fixed_fields []]]
+                                 else
+                                   B.case
+                                     ~lhs:(pat_construct nm (Some [%pat? x]))
+                                     ~guard:None
+                                     ~rhs:
+                                       [%expr
                                          [%e
-                                           (converter ~rename ~path
-                                              ~sparse:false)
-                                             typ]
-                                           x])
-                             l)];
-                    ]]
-            | Service _ | Resource _ | Operation _ -> assert false)
-            [%type: Yojson.Safe.t]))
+                                           B.pexp_constant
+                                             (const_string
+                                                (member_name ~fixed:fixed_fields
+                                                   constr))],
+                                           [%e
+                                             (converter ~rename ~path
+                                                ~sparse:false)
+                                               typ]
+                                             x])
+                               l)];
+                      ]]
+              | Service _ | Resource _ | Operation _ -> assert false)
+              [%type: Yojson.Safe.t]))
 
 let print_to_json ~rename ~fixed_fields shs =
   [%str
@@ -1200,7 +1222,7 @@ let print_to_json ~rename ~fixed_fields shs =
         (List.map (to_json ~fixed_fields ~rename) (IdMap.bindings shs))]
     end]
 
-let field_xml_converter ~rename ?param ((nm, typ, _) as field) =
+let field_xml_converter ~rename ?param ((nm, typ, traits) as field) =
   let path = Longident.(Ldot (Lident "Converters", "To_XML")) in
   let optional = param = None && optional_member field in
   let name =
@@ -1209,7 +1231,13 @@ let field_xml_converter ~rename ?param ((nm, typ, _) as field) =
   in
   let flat = flattened_member field in
 
-  let conv = converter ~rename ~path ~sparse:false typ in
+  let conv =
+    converter ~rename ~path ~sparse:false
+      ?timestamp_format:
+        (Option.map Yojson.Safe.Util.to_string
+           (List.assoc_opt "smithy.api#timestampFormat" traits))
+      typ
+  in
   let id = ident (Option.value ~default:(field_name nm ^ "'") param) in
   let field_builder =
     if flat then [%expr [%e conv] ~flat:[%e name]]
@@ -1236,125 +1264,140 @@ let to_xml ~rename (name, { typ; traits; _ }) =
   B.value_binding
     ~pat:(B.ppat_var (Location.mknoloc (type_name ~rename name)))
     ~expr:
-      (wrap
-         (B.pexp_fun Nolabel None
-            [%pat?
-              ([%p B.ppat_var (Location.mknoloc nm)] :
-                [%t type_ident ~rename name])]
-            (B.pexp_constraint
-               (match typ with
-               | Blob -> [%expr Converters.To_XML.blob [%e ident nm]]
-               | Boolean -> [%expr Converters.To_XML.boolean [%e ident nm]]
-               | String -> [%expr Converters.To_XML.string [%e ident nm]]
-               | Enum l ->
-                   [%expr
-                     Converters.To_XML.string
-                       [%e
-                         B.pexp_match (ident nm)
-                           (List.map
-                              (fun ((nm, _, _) as enum) ->
-                                B.case ~lhs:(pat_construct nm None) ~guard:None
-                                  ~rhs:
-                                    (B.pexp_constant
-                                       (const_string
-                                          (member_name ~fixed:false
-                                             ~name:"smithy.api#enumValue" enum))))
-                              l)]]
-               | Integer | IntEnum | Short ->
-                   [%expr Converters.To_XML.integer [%e ident nm]]
-               | Long -> [%expr Converters.To_XML.long [%e ident nm]]
-               | Float | Double -> [%expr Converters.To_XML.float [%e ident nm]]
-               | Byte -> [%expr Converters.To_XML.byte [%e ident nm]]
-               | Timestamp -> [%expr Converters.To_XML.timestamp [%e ident nm]]
-               | Document -> assert false
-               | List (id, traits') ->
-                   let sparse = List.mem_assoc "smithy.api#sparse" traits in
-                   assert (not sparse);
-                   let name =
-                     Option.map Yojson.Safe.Util.to_string
-                       (List.assoc_opt "smithy.api#xmlName" traits')
-                   in
-                   ( [%expr Converters.To_XML.list] |> fun e ->
-                     match name with
-                     | None -> e
-                     | Some name ->
-                         [%expr
-                           [%e e] ~name:[%e B.pexp_constant (const_string name)]]
-                   )
-                   |> fun e ->
-                   [%expr
-                     [%e e]
-                       [%e converter ~rename ~path ~sparse id]
-                       ?flat [%e ident nm]]
-               | Map ((_key, key_traits), (value, value_traits)) ->
-                   let sparse = List.mem_assoc "smithy.api#sparse" traits in
-                   assert (not sparse);
-                   let key_name =
-                     Option.map Yojson.Safe.Util.to_string
-                       (List.assoc_opt "smithy.api#xmlName" key_traits)
-                   in
-                   let value_name =
-                     Option.map Yojson.Safe.Util.to_string
-                       (List.assoc_opt "smithy.api#xmlName" value_traits)
-                   in
-                   ( ( [%expr Converters.To_XML.map] |> fun e ->
-                       match key_name with
-                       | None -> e
-                       | Some nm ->
-                           [%expr
-                             [%e e]
-                               ~key_name:[%e B.pexp_constant (const_string nm)]]
-                     )
-                   |> fun e ->
-                     match value_name with
-                     | None -> e
-                     | Some nm ->
-                         [%expr
-                           [%e e]
-                             ~value_name:[%e B.pexp_constant (const_string nm)]]
-                   )
-                   |> fun e ->
-                   [%expr
-                     [%e e]
-                       [%e converter ~rename ~path ~sparse value]
-                       ?flat [%e ident nm]]
-               | Structure [] -> [%expr Converters.To_XML.structure []]
-               | Structure l ->
-                   B.pexp_match (ident nm)
-                     [
-                       B.case
-                         ~lhs:
-                           (B.ppat_record
-                              (List.map
-                                 (fun (nm, _, _) ->
-                                   ( Location.mknoloc
-                                       (Longident.Lident (field_name nm)),
-                                     B.ppat_var
-                                       (Location.mknoloc (field_name nm ^ "'"))
-                                   ))
-                                 l)
-                              Closed)
-                         ~guard:None
-                         ~rhs:(structure_xml_converter ~rename l);
-                     ]
-               | Union l ->
-                   [%expr
-                     Converters.To_XML.structure
-                       [
-                         [%e
-                           B.pexp_match (ident nm)
+      (add_timestamp_parameter ~typ
+      @@ wrap
+      @@ B.pexp_fun Nolabel None
+           [%pat?
+             ([%p B.ppat_var (Location.mknoloc nm)] :
+               [%t type_ident ~rename name])]
+           (B.pexp_constraint
+              (match typ with
+              | Blob -> [%expr Converters.To_XML.blob [%e ident nm]]
+              | Boolean -> [%expr Converters.To_XML.boolean [%e ident nm]]
+              | String -> [%expr Converters.To_XML.string [%e ident nm]]
+              | Enum l ->
+                  [%expr
+                    Converters.To_XML.string
+                      [%e
+                        B.pexp_match (ident nm)
+                          (List.map
+                             (fun ((nm, _, _) as enum) ->
+                               B.case ~lhs:(pat_construct nm None) ~guard:None
+                                 ~rhs:
+                                   (B.pexp_constant
+                                      (const_string
+                                         (member_name ~fixed:false
+                                            ~name:"smithy.api#enumValue" enum))))
+                             l)]]
+              | Integer | IntEnum | Short ->
+                  [%expr Converters.To_XML.integer [%e ident nm]]
+              | Long -> [%expr Converters.To_XML.long [%e ident nm]]
+              | Float | Double -> [%expr Converters.To_XML.float [%e ident nm]]
+              | Byte -> [%expr Converters.To_XML.byte [%e ident nm]]
+              | Timestamp -> (
+                  match
+                    Option.map Yojson.Safe.Util.to_string
+                      (List.assoc_opt "smithy.api#timestampFormat" traits)
+                  with
+                  | None | Some "date-time" ->
+                      [%expr Converters.To_XML.timestamp ?format [%e ident nm]]
+                  | Some format ->
+                      let format = capitalized_identifier format in
+                      [%expr
+                        Converters.To_XML.timestamp
+                          ~format:
+                            (Option.value
+                               ~default:[%e B.pexp_variant format None] format)
+                          [%e ident nm]])
+              | Document -> assert false
+              | List (id, traits') ->
+                  let sparse = List.mem_assoc "smithy.api#sparse" traits in
+                  assert (not sparse);
+                  let name =
+                    Option.map Yojson.Safe.Util.to_string
+                      (List.assoc_opt "smithy.api#xmlName" traits')
+                  in
+                  ( [%expr Converters.To_XML.list] |> fun e ->
+                    match name with
+                    | None -> e
+                    | Some name ->
+                        [%expr
+                          [%e e] ~name:[%e B.pexp_constant (const_string name)]]
+                  )
+                  |> fun e ->
+                  [%expr
+                    [%e e]
+                      [%e converter ~rename ~path ~sparse id]
+                      ?flat [%e ident nm]]
+              | Map ((_key, key_traits), (value, value_traits)) ->
+                  let sparse = List.mem_assoc "smithy.api#sparse" traits in
+                  assert (not sparse);
+                  let key_name =
+                    Option.map Yojson.Safe.Util.to_string
+                      (List.assoc_opt "smithy.api#xmlName" key_traits)
+                  in
+                  let value_name =
+                    Option.map Yojson.Safe.Util.to_string
+                      (List.assoc_opt "smithy.api#xmlName" value_traits)
+                  in
+                  ( ( [%expr Converters.To_XML.map] |> fun e ->
+                      match key_name with
+                      | None -> e
+                      | Some nm ->
+                          [%expr
+                            [%e e]
+                              ~key_name:[%e B.pexp_constant (const_string nm)]]
+                    )
+                  |> fun e ->
+                    match value_name with
+                    | None -> e
+                    | Some nm ->
+                        [%expr
+                          [%e e]
+                            ~value_name:[%e B.pexp_constant (const_string nm)]]
+                  )
+                  |> fun e ->
+                  [%expr
+                    [%e e]
+                      [%e converter ~rename ~path ~sparse value]
+                      ?flat [%e ident nm]]
+              | Structure [] -> [%expr Converters.To_XML.structure []]
+              | Structure l ->
+                  B.pexp_match (ident nm)
+                    [
+                      B.case
+                        ~lhs:
+                          (B.ppat_record
                              (List.map
-                                (fun ((nm, _, _) as constr) ->
-                                  B.case
-                                    ~lhs:(pat_construct nm (Some [%pat? x]))
-                                    ~guard:None
-                                    ~rhs:
-                                      (field_xml_converter ~rename ~param:"x"
-                                         constr))
-                                l)];
-                       ]]
-               | Service _ | Resource _ | Operation _ -> assert false)
-               [%type: Converters.To_XML.t])))
+                                (fun (nm, _, _) ->
+                                  ( Location.mknoloc
+                                      (Longident.Lident (field_name nm)),
+                                    B.ppat_var
+                                      (Location.mknoloc (field_name nm ^ "'"))
+                                  ))
+                                l)
+                             Closed)
+                        ~guard:None
+                        ~rhs:(structure_xml_converter ~rename l);
+                    ]
+              | Union l ->
+                  [%expr
+                    Converters.To_XML.structure
+                      [
+                        [%e
+                          B.pexp_match (ident nm)
+                            (List.map
+                               (fun ((nm, _, _) as constr) ->
+                                 B.case
+                                   ~lhs:(pat_construct nm (Some [%pat? x]))
+                                   ~guard:None
+                                   ~rhs:
+                                     (field_xml_converter ~rename ~param:"x"
+                                        constr))
+                               l)];
+                      ]]
+              | Service _ | Resource _ | Operation _ -> assert false)
+              [%type: Converters.To_XML.t]))
 
 let print_to_xml ~rename shs =
   [%str
@@ -1387,7 +1430,13 @@ let field_graph_converter ~rename ~protocol ?param ((nm, typ, traits) as field)
   in
   let flat = flattened_member field in
 
-  let conv = converter ~rename ~path ~sparse:false typ in
+  let conv =
+    converter ~rename ~path ~sparse:false
+      ?timestamp_format:
+        (Option.map Yojson.Safe.Util.to_string
+           (List.assoc_opt "smithy.api#timestampFormat" traits))
+      typ
+  in
   let id = ident (Option.value ~default:(field_name nm ^ "'") param) in
   let field_builder =
     [%expr
@@ -1416,129 +1465,143 @@ let to_graph ~rename ~protocol (name, { typ; traits; _ }) =
   B.value_binding
     ~pat:(B.ppat_var (Location.mknoloc (type_name ~rename name)))
     ~expr:
-      (wrap
-         (B.pexp_fun Nolabel None
-            [%pat?
-              ([%p B.ppat_var (Location.mknoloc nm)] :
-                [%t type_ident ~rename name])]
-            (B.pexp_constraint
-               (match typ with
-               | Blob -> [%expr Converters.To_Graph.blob [%e ident nm]]
-               | Boolean -> [%expr Converters.To_Graph.boolean [%e ident nm]]
-               | String -> [%expr Converters.To_Graph.string [%e ident nm]]
-               | Enum l ->
-                   [%expr
-                     Converters.To_Graph.string
-                       [%e
-                         B.pexp_match (ident nm)
-                           (List.map
-                              (fun ((nm, _, _) as enum) ->
-                                B.case ~lhs:(pat_construct nm None) ~guard:None
-                                  ~rhs:
-                                    (B.pexp_constant
-                                       (const_string
-                                          (member_name ~fixed:false
-                                             ~name:"smithy.api#enumValue" enum))))
-                              l)]]
-               | Integer | IntEnum | Short ->
-                   [%expr Converters.To_Graph.integer [%e ident nm]]
-               | Long -> [%expr Converters.To_Graph.long [%e ident nm]]
-               | Float | Double ->
-                   [%expr Converters.To_Graph.float [%e ident nm]]
-               | Byte -> [%expr Converters.To_Graph.byte [%e ident nm]]
-               | Timestamp ->
-                   [%expr Converters.To_Graph.timestamp [%e ident nm]]
-               | Document -> [%expr Converters.To_Graph.document [%e ident nm]]
-               | List (id, traits') ->
-                   let sparse = List.mem_assoc "smithy.api#sparse" traits in
-                   assert (not sparse);
-                   let name = query_alt_name ~protocol ~traits:traits' in
-                   ( [%expr Converters.To_Graph.list] |> fun e ->
-                     match name with
-                     | None -> e
-                     | Some name ->
-                         [%expr
-                           [%e e] ~name:[%e B.pexp_constant (const_string name)]]
-                   )
-                   |> fun e ->
-                   [%expr
-                     [%e e]
-                       [%e converter ~rename ~path ~sparse id]
-                       ?flat [%e ident nm]]
-               | Map ((_key, key_traits), (value, value_traits)) ->
-                   let sparse = List.mem_assoc "smithy.api#sparse" traits in
-                   assert (not sparse);
-                   let name = query_alt_name ~protocol ~traits in
-                   let key_name = query_alt_name ~protocol ~traits:key_traits in
-                   let value_name =
-                     query_alt_name ~protocol ~traits:value_traits
-                   in
-                   ( ( ( [%expr Converters.To_Graph.map] |> fun e ->
-                         match name with
-                         | None -> e
-                         | Some nm ->
-                             [%expr
-                               [%e e]
-                                 ~name:[%e B.pexp_constant (const_string nm)]]
-                       )
-                     |> fun e ->
-                       match key_name with
-                       | None -> e
-                       | Some nm ->
-                           [%expr
-                             [%e e]
-                               ~key_name:[%e B.pexp_constant (const_string nm)]]
-                     )
-                   |> fun e ->
-                     match value_name with
-                     | None -> e
-                     | Some nm ->
-                         [%expr
-                           [%e e]
-                             ~value_name:[%e B.pexp_constant (const_string nm)]]
-                   )
-                   |> fun e ->
-                   [%expr
-                     [%e e]
-                       [%e converter ~rename ~path ~sparse value]
-                       ?flat [%e ident nm]]
-               | Structure [] -> [%expr Converters.To_Graph.structure []]
-               | Structure l ->
-                   B.pexp_match (ident nm)
-                     [
-                       B.case
-                         ~lhs:
-                           (B.ppat_record
-                              (List.map
-                                 (fun (nm, _, _) ->
-                                   ( Location.mknoloc
-                                       (Longident.Lident (field_name nm)),
-                                     B.ppat_var
-                                       (Location.mknoloc (field_name nm ^ "'"))
-                                   ))
-                                 l)
-                              Closed)
-                         ~guard:None
-                         ~rhs:(structure_graph_converter ~rename ~protocol l);
-                     ]
-               | Union l ->
-                   [%expr
-                     Converters.To_Graph.structure
-                       [
-                         [%e
-                           B.pexp_match (ident nm)
+      (add_timestamp_parameter ~typ
+      @@ wrap
+      @@ B.pexp_fun Nolabel None
+           [%pat?
+             ([%p B.ppat_var (Location.mknoloc nm)] :
+               [%t type_ident ~rename name])]
+           (B.pexp_constraint
+              (match typ with
+              | Blob -> [%expr Converters.To_Graph.blob [%e ident nm]]
+              | Boolean -> [%expr Converters.To_Graph.boolean [%e ident nm]]
+              | String -> [%expr Converters.To_Graph.string [%e ident nm]]
+              | Enum l ->
+                  [%expr
+                    Converters.To_Graph.string
+                      [%e
+                        B.pexp_match (ident nm)
+                          (List.map
+                             (fun ((nm, _, _) as enum) ->
+                               B.case ~lhs:(pat_construct nm None) ~guard:None
+                                 ~rhs:
+                                   (B.pexp_constant
+                                      (const_string
+                                         (member_name ~fixed:false
+                                            ~name:"smithy.api#enumValue" enum))))
+                             l)]]
+              | Integer | IntEnum | Short ->
+                  [%expr Converters.To_Graph.integer [%e ident nm]]
+              | Long -> [%expr Converters.To_Graph.long [%e ident nm]]
+              | Float | Double ->
+                  [%expr Converters.To_Graph.float [%e ident nm]]
+              | Byte -> [%expr Converters.To_Graph.byte [%e ident nm]]
+              | Timestamp -> (
+                  match
+                    Option.map Yojson.Safe.Util.to_string
+                      (List.assoc_opt "smithy.api#timestampFormat" traits)
+                  with
+                  | None | Some "date-time" ->
+                      [%expr
+                        Converters.To_Graph.timestamp ?format [%e ident nm]]
+                  | Some format ->
+                      let format = capitalized_identifier format in
+                      [%expr
+                        Converters.To_Graph.timestamp
+                          ~format:
+                            (Option.value
+                               ~default:[%e B.pexp_variant format None] format)
+                          [%e ident nm]])
+              | Document -> [%expr Converters.To_Graph.document [%e ident nm]]
+              | List (id, traits') ->
+                  let sparse = List.mem_assoc "smithy.api#sparse" traits in
+                  assert (not sparse);
+                  let name = query_alt_name ~protocol ~traits:traits' in
+                  ( [%expr Converters.To_Graph.list] |> fun e ->
+                    match name with
+                    | None -> e
+                    | Some name ->
+                        [%expr
+                          [%e e] ~name:[%e B.pexp_constant (const_string name)]]
+                  )
+                  |> fun e ->
+                  [%expr
+                    [%e e]
+                      [%e converter ~rename ~path ~sparse id]
+                      ?flat [%e ident nm]]
+              | Map ((_key, key_traits), (value, value_traits)) ->
+                  let sparse = List.mem_assoc "smithy.api#sparse" traits in
+                  assert (not sparse);
+                  let name = query_alt_name ~protocol ~traits in
+                  let key_name = query_alt_name ~protocol ~traits:key_traits in
+                  let value_name =
+                    query_alt_name ~protocol ~traits:value_traits
+                  in
+                  ( ( ( [%expr Converters.To_Graph.map] |> fun e ->
+                        match name with
+                        | None -> e
+                        | Some nm ->
+                            [%expr
+                              [%e e]
+                                ~name:[%e B.pexp_constant (const_string nm)]] )
+                    |> fun e ->
+                      match key_name with
+                      | None -> e
+                      | Some nm ->
+                          [%expr
+                            [%e e]
+                              ~key_name:[%e B.pexp_constant (const_string nm)]]
+                    )
+                  |> fun e ->
+                    match value_name with
+                    | None -> e
+                    | Some nm ->
+                        [%expr
+                          [%e e]
+                            ~value_name:[%e B.pexp_constant (const_string nm)]]
+                  )
+                  |> fun e ->
+                  [%expr
+                    [%e e]
+                      [%e converter ~rename ~path ~sparse value]
+                      ?flat [%e ident nm]]
+              | Structure [] -> [%expr Converters.To_Graph.structure []]
+              | Structure l ->
+                  B.pexp_match (ident nm)
+                    [
+                      B.case
+                        ~lhs:
+                          (B.ppat_record
                              (List.map
-                                (fun ((nm, _, _) as constr) ->
-                                  B.case
-                                    ~lhs:(pat_construct nm (Some [%pat? x]))
-                                    ~guard:None
-                                    ~rhs:
-                                      (field_graph_converter ~rename ~protocol
-                                         ~param:"x" constr))
-                                l)];
-                       ]]
-               | Service _ | Resource _ | Operation _ -> assert false)
-               [%type: Converters.To_Graph.t])))
+                                (fun (nm, _, _) ->
+                                  ( Location.mknoloc
+                                      (Longident.Lident (field_name nm)),
+                                    B.ppat_var
+                                      (Location.mknoloc (field_name nm ^ "'"))
+                                  ))
+                                l)
+                             Closed)
+                        ~guard:None
+                        ~rhs:(structure_graph_converter ~rename ~protocol l);
+                    ]
+              | Union l ->
+                  [%expr
+                    Converters.To_Graph.structure
+                      [
+                        [%e
+                          B.pexp_match (ident nm)
+                            (List.map
+                               (fun ((nm, _, _) as constr) ->
+                                 B.case
+                                   ~lhs:(pat_construct nm (Some [%pat? x]))
+                                   ~guard:None
+                                   ~rhs:
+                                     (field_graph_converter ~rename ~protocol
+                                        ~param:"x" constr))
+                               l)];
+                      ]]
+              | Service _ | Resource _ | Operation _ -> assert false)
+              [%type: Converters.To_Graph.t]))
 
 let print_to_graph ~rename ~protocol shs =
   [%str
@@ -1554,148 +1617,163 @@ let from_json ~rename ~fixed_fields (name, { typ; traits; _ }) =
   B.value_binding
     ~pat:(B.ppat_var (Location.mknoloc (type_name ~rename name)))
     ~expr:
-      (B.pexp_fun Nolabel None
-         [%pat? ([%p B.ppat_var (Location.mknoloc nm)] : Yojson.Safe.t)]
-         (B.pexp_constraint
-            (match typ with
-            | Blob -> [%expr Converters.From_JSON.blob [%e ident nm]]
-            | Boolean -> [%expr Converters.From_JSON.boolean [%e ident nm]]
-            | String -> [%expr Converters.From_JSON.string [%e ident nm]]
-            | Enum l ->
-                B.pexp_match
-                  [%expr Converters.From_JSON.string [%e ident nm]]
-                  (List.map
-                     (fun ((nm, _, _) as enum) ->
-                       B.case
-                         ~lhs:
-                           (B.ppat_constant
-                              (const_string
-                                 (member_name ~fixed:false
-                                    ~name:"smithy.api#enumValue" enum)))
-                         ~guard:None
-                         ~rhs:
-                           (B.pexp_construct
-                              (Location.mknoloc
-                                 (Longident.Lident (constr_name nm)))
-                              None))
-                     l
-                  @ [
-                      B.case
-                        ~lhs:[%pat? _]
-                        ~guard:None
-                        ~rhs:[%expr assert false];
-                    ])
-            | Integer | IntEnum | Short ->
-                [%expr Converters.From_JSON.integer [%e ident nm]]
-            | Long -> [%expr Converters.From_JSON.long [%e ident nm]]
-            | Float | Double -> [%expr Converters.From_JSON.float [%e ident nm]]
-            | Byte -> [%expr Converters.From_JSON.byte [%e ident nm]]
-            | Timestamp -> (
-                match
-                  Option.map Yojson.Safe.Util.to_string
-                    (List.assoc_opt "smithy.api#timestampFormat" traits)
-                with
-                | None | Some "epoch-seconds" ->
-                    [%expr Converters.From_JSON.timestamp [%e ident nm]]
-                | Some format ->
-                    let format = capitalized_identifier format in
-                    [%expr
-                      Converters.From_JSON.timestamp
-                        ~format:[%e B.pexp_variant format None] [%e ident nm]])
-            | Document -> [%expr Converters.From_JSON.document [%e ident nm]]
-            | List (id, _) ->
-                let sparse = List.mem_assoc "smithy.api#sparse" traits in
-                [%expr
-                  Converters.From_JSON.list
-                    [%e converter ~rename ~path ~sparse id]
-                    [%e ident nm]]
-            | Map (_key, (value, _)) ->
-                let sparse = List.mem_assoc "smithy.api#sparse" traits in
-                [%expr
-                  Converters.From_JSON.map
-                    [%e converter ~rename ~path ~sparse value]
-                    [%e ident nm]]
-            | Structure [] -> [%expr ()]
-            | Structure l ->
-                [%expr
-                  let x = Converters.From_JSON.structure [%e ident nm] in
-                  [%e
-                    B.pexp_record
-                      (List.map
-                         (fun ((nm, typ, _) as field) ->
-                           let optional = optional_member field in
-                           let label =
-                             Location.mknoloc (Longident.Lident (field_name nm))
-                           in
-                           ( label,
-                             [%expr
-                               [%e converter ~rename ~path ~sparse:optional typ]
-                                 (Converters.From_JSON.field
-                                    [%e
-                                      B.pexp_constant
-                                        (const_string
-                                           (member_name ~fixed:fixed_fields
-                                              field))]
-                                    x)] ))
-                         l)
-                      None]]
-            | Union l ->
-                B.pexp_match
-                  [%expr Converters.From_JSON.structure [%e ident nm]]
-                  (List.map
-                     (fun ((nm, typ, _) as constr) ->
-                       if typ = unit_type then
+      (add_timestamp_parameter ~typ
+      @@ B.pexp_fun Nolabel None
+           [%pat? ([%p B.ppat_var (Location.mknoloc nm)] : Yojson.Safe.t)]
+           (B.pexp_constraint
+              (match typ with
+              | Blob -> [%expr Converters.From_JSON.blob [%e ident nm]]
+              | Boolean -> [%expr Converters.From_JSON.boolean [%e ident nm]]
+              | String -> [%expr Converters.From_JSON.string [%e ident nm]]
+              | Enum l ->
+                  B.pexp_match
+                    [%expr Converters.From_JSON.string [%e ident nm]]
+                    (List.map
+                       (fun ((nm, _, _) as enum) ->
                          B.case
                            ~lhs:
-                             [%pat?
-                               ( [%p
-                                   B.ppat_constant
-                                     (const_string
-                                        (member_name ~fixed:fixed_fields constr))],
-                                 _ )
-                               :: _]
+                             (B.ppat_constant
+                                (const_string
+                                   (member_name ~fixed:false
+                                      ~name:"smithy.api#enumValue" enum)))
                            ~guard:None
                            ~rhs:
                              (B.pexp_construct
                                 (Location.mknoloc
                                    (Longident.Lident (constr_name nm)))
-                                None)
-                       else
-                         B.case
-                           ~lhs:
-                             [%pat?
-                               ( [%p
-                                   B.ppat_constant
-                                     (const_string
-                                        (member_name ~fixed:fixed_fields constr))],
-                                 x )
-                               :: _]
-                           ~guard:None
-                           ~rhs:
-                             (B.pexp_construct
-                                (Location.mknoloc
-                                   (Longident.Lident (constr_name nm)))
-                                (Some
-                                   [%expr
-                                     [%e
-                                       (converter ~rename ~path ~sparse:false)
-                                         typ]
-                                       x])))
-                     l
-                  @ [
-                      (* ignore unknown properties *)
-                      B.case
-                        ~lhs:[%pat? _ :: r]
-                        ~guard:None
-                        ~rhs:
-                          [%expr [%e ident (type_name ~rename name)] (`Assoc r)];
-                      B.case
-                        ~lhs:[%pat? []]
-                        ~guard:None
-                        ~rhs:[%expr assert false];
-                    ])
-            | Service _ | Resource _ | Operation _ -> assert false)
-            (type_ident ~rename name)))
+                                None))
+                       l
+                    @ [
+                        B.case
+                          ~lhs:[%pat? _]
+                          ~guard:None
+                          ~rhs:[%expr assert false];
+                      ])
+              | Integer | IntEnum | Short ->
+                  [%expr Converters.From_JSON.integer [%e ident nm]]
+              | Long -> [%expr Converters.From_JSON.long [%e ident nm]]
+              | Float | Double ->
+                  [%expr Converters.From_JSON.float [%e ident nm]]
+              | Byte -> [%expr Converters.From_JSON.byte [%e ident nm]]
+              | Timestamp -> (
+                  match
+                    Option.map Yojson.Safe.Util.to_string
+                      (List.assoc_opt "smithy.api#timestampFormat" traits)
+                  with
+                  | None | Some "epoch-seconds" ->
+                      [%expr Converters.From_JSON.timestamp [%e ident nm]]
+                  | Some format ->
+                      let format = capitalized_identifier format in
+                      [%expr
+                        Converters.From_JSON.timestamp
+                          ~format:
+                            (Option.value
+                               ~default:[%e B.pexp_variant format None] format)
+                          [%e ident nm]])
+              | Document -> [%expr Converters.From_JSON.document [%e ident nm]]
+              | List (id, _) ->
+                  let sparse = List.mem_assoc "smithy.api#sparse" traits in
+                  [%expr
+                    Converters.From_JSON.list
+                      [%e converter ~rename ~path ~sparse id]
+                      [%e ident nm]]
+              | Map (_key, (value, _)) ->
+                  let sparse = List.mem_assoc "smithy.api#sparse" traits in
+                  [%expr
+                    Converters.From_JSON.map
+                      [%e converter ~rename ~path ~sparse value]
+                      [%e ident nm]]
+              | Structure [] -> [%expr ()]
+              | Structure l ->
+                  [%expr
+                    let x = Converters.From_JSON.structure [%e ident nm] in
+                    [%e
+                      B.pexp_record
+                        (List.map
+                           (fun ((nm, typ, traits) as field) ->
+                             let optional = optional_member field in
+                             let label =
+                               Location.mknoloc
+                                 (Longident.Lident (field_name nm))
+                             in
+                             ( label,
+                               [%expr
+                                 [%e
+                                   converter ~rename ~path ~sparse:optional
+                                     ?timestamp_format:
+                                       (Option.map Yojson.Safe.Util.to_string
+                                          (List.assoc_opt
+                                             "smithy.api#timestampFormat" traits))
+                                     typ]
+                                   (Converters.From_JSON.field
+                                      [%e
+                                        B.pexp_constant
+                                          (const_string
+                                             (member_name ~fixed:fixed_fields
+                                                field))]
+                                      x)] ))
+                           l)
+                        None]]
+              | Union l ->
+                  B.pexp_match
+                    [%expr Converters.From_JSON.structure [%e ident nm]]
+                    (List.map
+                       (fun ((nm, typ, _) as constr) ->
+                         if typ = unit_type then
+                           B.case
+                             ~lhs:
+                               [%pat?
+                                 ( [%p
+                                     B.ppat_constant
+                                       (const_string
+                                          (member_name ~fixed:fixed_fields
+                                             constr))],
+                                   _ )
+                                 :: _]
+                             ~guard:None
+                             ~rhs:
+                               (B.pexp_construct
+                                  (Location.mknoloc
+                                     (Longident.Lident (constr_name nm)))
+                                  None)
+                         else
+                           B.case
+                             ~lhs:
+                               [%pat?
+                                 ( [%p
+                                     B.ppat_constant
+                                       (const_string
+                                          (member_name ~fixed:fixed_fields
+                                             constr))],
+                                   x )
+                                 :: _]
+                             ~guard:None
+                             ~rhs:
+                               (B.pexp_construct
+                                  (Location.mknoloc
+                                     (Longident.Lident (constr_name nm)))
+                                  (Some
+                                     [%expr
+                                       [%e
+                                         (converter ~rename ~path ~sparse:false)
+                                           typ]
+                                         x])))
+                       l
+                    @ [
+                        (* ignore unknown properties *)
+                        B.case
+                          ~lhs:[%pat? _ :: r]
+                          ~guard:None
+                          ~rhs:
+                            [%expr
+                              [%e ident (type_name ~rename name)] (`Assoc r)];
+                        B.case
+                          ~lhs:[%pat? []]
+                          ~guard:None
+                          ~rhs:[%expr assert false];
+                      ])
+              | Service _ | Resource _ | Operation _ -> assert false)
+              (type_ident ~rename name)))
 
 let print_from_json ~rename ~fixed_fields shs =
   [%str
@@ -1714,170 +1792,193 @@ let from_xml ~rename (name, { typ; traits; _ }) =
   B.value_binding
     ~pat:(B.ppat_var (Location.mknoloc (type_name ~rename name)))
     ~expr:
-      (wrap
-         (B.pexp_fun Nolabel None
-            [%pat?
-              ([%p B.ppat_var (Location.mknoloc nm)] : Converters.From_XML.t)]
-            (B.pexp_constraint
-               (match typ with
-               | Blob -> [%expr Converters.From_XML.blob [%e ident nm]]
-               | Boolean -> [%expr Converters.From_XML.boolean [%e ident nm]]
-               | String -> [%expr Converters.From_XML.string [%e ident nm]]
-               | Enum l ->
-                   B.pexp_match
-                     [%expr Converters.From_XML.string [%e ident nm]]
-                     (List.map
-                        (fun ((nm, _, _) as enum) ->
-                          B.case
-                            ~lhs:
-                              (B.ppat_constant
-                                 (const_string
-                                    (member_name ~fixed:false
-                                       ~name:"smithy.api#enumValue" enum)))
-                            ~guard:None
-                            ~rhs:
-                              (B.pexp_construct
-                                 (Location.mknoloc
-                                    (Longident.Lident (constr_name nm)))
-                                 None))
-                        l
-                     @ [
-                         B.case
-                           ~lhs:[%pat? _]
-                           ~guard:None
-                           ~rhs:[%expr assert false];
-                       ])
-               | Integer | IntEnum | Short ->
-                   [%expr Converters.From_XML.integer [%e ident nm]]
-               | Long -> [%expr Converters.From_XML.long [%e ident nm]]
-               | Float | Double ->
-                   [%expr Converters.From_XML.float [%e ident nm]]
-               | Byte -> [%expr Converters.From_XML.byte [%e ident nm]]
-               | Timestamp ->
-                   [%expr Converters.From_XML.timestamp [%e ident nm]]
-               | Document -> assert false
-               | List (id, traits') ->
-                   let sparse = List.mem_assoc "smithy.api#sparse" traits in
-                   assert (not sparse);
-                   let name =
-                     Option.map Yojson.Safe.Util.to_string
-                       (List.assoc_opt "smithy.api#xmlName" traits')
-                   in
-                   ( [%expr Converters.From_XML.list] |> fun e ->
-                     match name with
-                     | None -> e
-                     | Some name ->
+      (add_timestamp_parameter ~typ
+      @@ wrap
+           (B.pexp_fun Nolabel None
+              [%pat?
+                ([%p B.ppat_var (Location.mknoloc nm)] : Converters.From_XML.t)]
+              (B.pexp_constraint
+                 (match typ with
+                 | Blob -> [%expr Converters.From_XML.blob [%e ident nm]]
+                 | Boolean -> [%expr Converters.From_XML.boolean [%e ident nm]]
+                 | String -> [%expr Converters.From_XML.string [%e ident nm]]
+                 | Enum l ->
+                     B.pexp_match
+                       [%expr Converters.From_XML.string [%e ident nm]]
+                       (List.map
+                          (fun ((nm, _, _) as enum) ->
+                            B.case
+                              ~lhs:
+                                (B.ppat_constant
+                                   (const_string
+                                      (member_name ~fixed:false
+                                         ~name:"smithy.api#enumValue" enum)))
+                              ~guard:None
+                              ~rhs:
+                                (B.pexp_construct
+                                   (Location.mknoloc
+                                      (Longident.Lident (constr_name nm)))
+                                   None))
+                          l
+                       @ [
+                           B.case
+                             ~lhs:[%pat? _]
+                             ~guard:None
+                             ~rhs:[%expr assert false];
+                         ])
+                 | Integer | IntEnum | Short ->
+                     [%expr Converters.From_XML.integer [%e ident nm]]
+                 | Long -> [%expr Converters.From_XML.long [%e ident nm]]
+                 | Float | Double ->
+                     [%expr Converters.From_XML.float [%e ident nm]]
+                 | Byte -> [%expr Converters.From_XML.byte [%e ident nm]]
+                 | Timestamp -> (
+                     match
+                       Option.map Yojson.Safe.Util.to_string
+                         (List.assoc_opt "smithy.api#timestampFormat" traits)
+                     with
+                     | None | Some "date-time" ->
                          [%expr
-                           [%e e] ~name:[%e B.pexp_constant (const_string name)]]
-                   )
-                   |> fun e ->
-                   [%expr
-                     [%e e]
-                       [%e converter ~rename ~path ~sparse id]
-                       ?flat [%e ident nm]]
-               | Map ((_key, key_traits), (value, value_traits)) ->
-                   let sparse = List.mem_assoc "smithy.api#sparse" traits in
-                   assert (not sparse);
-                   let key_name =
-                     Option.map Yojson.Safe.Util.to_string
-                       (List.assoc_opt "smithy.api#xmlName" key_traits)
-                   in
-                   let value_name =
-                     Option.map Yojson.Safe.Util.to_string
-                       (List.assoc_opt "smithy.api#xmlName" value_traits)
-                   in
-                   ( ( [%expr Converters.From_XML.map] |> fun e ->
-                       match key_name with
+                           Converters.From_XML.timestamp ?format [%e ident nm]]
+                     | Some format ->
+                         let format = capitalized_identifier format in
+                         [%expr
+                           Converters.From_XML.timestamp
+                             ~format:
+                               (Option.value
+                                  ~default:[%e B.pexp_variant format None]
+                                  format)
+                             [%e ident nm]])
+                 | Document -> assert false
+                 | List (id, traits') ->
+                     let sparse = List.mem_assoc "smithy.api#sparse" traits in
+                     assert (not sparse);
+                     let name =
+                       Option.map Yojson.Safe.Util.to_string
+                         (List.assoc_opt "smithy.api#xmlName" traits')
+                     in
+                     ( [%expr Converters.From_XML.list] |> fun e ->
+                       match name with
+                       | None -> e
+                       | Some name ->
+                           [%expr
+                             [%e e]
+                               ~name:[%e B.pexp_constant (const_string name)]]
+                     )
+                     |> fun e ->
+                     [%expr
+                       [%e e]
+                         [%e converter ~rename ~path ~sparse id]
+                         ?flat [%e ident nm]]
+                 | Map ((_key, key_traits), (value, value_traits)) ->
+                     let sparse = List.mem_assoc "smithy.api#sparse" traits in
+                     assert (not sparse);
+                     let key_name =
+                       Option.map Yojson.Safe.Util.to_string
+                         (List.assoc_opt "smithy.api#xmlName" key_traits)
+                     in
+                     let value_name =
+                       Option.map Yojson.Safe.Util.to_string
+                         (List.assoc_opt "smithy.api#xmlName" value_traits)
+                     in
+                     ( ( [%expr Converters.From_XML.map] |> fun e ->
+                         match key_name with
+                         | None -> e
+                         | Some nm ->
+                             [%expr
+                               [%e e]
+                                 ~key_name:
+                                   [%e B.pexp_constant (const_string nm)]] )
+                     |> fun e ->
+                       match value_name with
                        | None -> e
                        | Some nm ->
                            [%expr
                              [%e e]
-                               ~key_name:[%e B.pexp_constant (const_string nm)]]
-                     )
-                   |> fun e ->
-                     match value_name with
-                     | None -> e
-                     | Some nm ->
-                         [%expr
-                           [%e e]
-                             ~value_name:[%e B.pexp_constant (const_string nm)]]
-                   )
-                   |> fun e ->
-                   [%expr
-                     [%e e]
-                       [%e converter ~rename ~path ~sparse value]
-                       [%e ident nm]]
-               | Structure [] -> [%expr ()]
-               | Structure l ->
-                   let x = ident nm in
-                   [%expr
-                     [%e
-                       B.pexp_record
-                         (List.map
-                            (fun ((nm, typ, _) as field) ->
-                              ( Location.mknoloc
-                                  (Longident.Lident (field_name nm)),
-                                let optional = optional_member field in
-                                let name =
-                                  B.pexp_constant
-                                    (const_string
-                                       (member_name ~fixed:false
-                                          ~name:"smithy.api#xmlName" field))
-                                in
-                                let flat = flattened_member field in
-                                let conv =
-                                  converter ~rename ~path ~sparse:false typ
-                                in
-                                if flat then
-                                  let e =
-                                    [%expr
-                                      Converters.From_XML.flattened_field
-                                        [%e name] [%e conv] [%e x]]
-                                  in
-                                  if optional then [%expr Some [%e e]] else e
-                                else
-                                  [%expr
-                                    [%e
-                                      if optional then
-                                        [%expr Converters.From_XML.opt_field]
-                                      else [%expr Converters.From_XML.field]]
-                                      [%e name] [%e conv] [%e x]] ))
-                            l)
-                         None]]
-               | Union l ->
-                   B.pexp_match
-                     [%expr Converters.From_XML.union [%e ident nm]]
-                     (List.map
-                        (fun ((nm, typ, _) as constr) ->
-                          B.case
-                            ~lhs:
-                              [%pat?
-                                ( [%p
-                                    B.ppat_constant
+                               ~value_name:
+                                 [%e B.pexp_constant (const_string nm)]] )
+                     |> fun e ->
+                     [%expr
+                       [%e e]
+                         [%e converter ~rename ~path ~sparse value]
+                         [%e ident nm]]
+                 | Structure [] -> [%expr ()]
+                 | Structure l ->
+                     let x = ident nm in
+                     [%expr
+                       [%e
+                         B.pexp_record
+                           (List.map
+                              (fun ((nm, typ, traits) as field) ->
+                                ( Location.mknoloc
+                                    (Longident.Lident (field_name nm)),
+                                  let optional = optional_member field in
+                                  let name =
+                                    B.pexp_constant
                                       (const_string
                                          (member_name ~fixed:false
-                                            ~name:"smithy.api#xmlName" constr))],
-                                  x )]
-                            ~guard:None
-                            ~rhs:
-                              (B.pexp_construct
-                                 (Location.mknoloc
-                                    (Longident.Lident (constr_name nm)))
-                                 (Some
+                                            ~name:"smithy.api#xmlName" field))
+                                  in
+                                  let flat = flattened_member field in
+                                  let conv =
+                                    converter ~rename ~path ~sparse:false
+                                      ?timestamp_format:
+                                        (Option.map Yojson.Safe.Util.to_string
+                                           (List.assoc_opt
+                                              "smithy.api#timestampFormat"
+                                              traits))
+                                      typ
+                                  in
+                                  if flat then
+                                    let e =
+                                      [%expr
+                                        Converters.From_XML.flattened_field
+                                          [%e name] [%e conv] [%e x]]
+                                    in
+                                    if optional then [%expr Some [%e e]] else e
+                                  else
                                     [%expr
                                       [%e
-                                        (converter ~rename ~path ~sparse:false)
-                                          typ]
-                                        x])))
-                        l
-                     @ [
-                         B.case
-                           ~lhs:[%pat? _]
-                           ~guard:None
-                           ~rhs:[%expr assert false];
-                       ])
-               | Service _ | Resource _ | Operation _ -> assert false)
-               (type_ident ~rename name))))
+                                        if optional then
+                                          [%expr Converters.From_XML.opt_field]
+                                        else [%expr Converters.From_XML.field]]
+                                        [%e name] [%e conv] [%e x]] ))
+                              l)
+                           None]]
+                 | Union l ->
+                     B.pexp_match
+                       [%expr Converters.From_XML.union [%e ident nm]]
+                       (List.map
+                          (fun ((nm, typ, _) as constr) ->
+                            B.case
+                              ~lhs:
+                                [%pat?
+                                  ( [%p
+                                      B.ppat_constant
+                                        (const_string
+                                           (member_name ~fixed:false
+                                              ~name:"smithy.api#xmlName" constr))],
+                                    x )]
+                              ~guard:None
+                              ~rhs:
+                                (B.pexp_construct
+                                   (Location.mknoloc
+                                      (Longident.Lident (constr_name nm)))
+                                   (Some
+                                      [%expr
+                                        [%e
+                                          (converter ~rename ~path ~sparse:false)
+                                            typ]
+                                          x])))
+                          l
+                       @ [
+                           B.case
+                             ~lhs:[%pat? _]
+                             ~guard:None
+                             ~rhs:[%expr assert false];
+                         ])
+                 | Service _ | Resource _ | Operation _ -> assert false)
+                 (type_ident ~rename name))))
 
 let print_from_xml ~rename shs =
   [%str

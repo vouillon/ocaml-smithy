@@ -30,6 +30,12 @@ module Timestamp = struct
           Printf.sprintf "%.0f" (to_epoch_seconds t)
         else Printf.sprintf "%.3f" (to_epoch_seconds t)
     | `Http_date -> to_http_date t
+
+  let from_string ~format t =
+    match format with
+    | `Date_time -> from_date_time t
+    | `Epoch_seconds -> from_epoch_seconds (float_of_string t)
+    | `Http_date -> from_http_date t
 end
 
 module To_String = struct
@@ -282,7 +288,9 @@ module To_XML = struct
          else "Infinity");
     ]
 
-  let timestamp x = [ `Data (Timestamp.to_date_time x) ]
+  let timestamp ?(format = `Date_time) x =
+    [ `Data (Timestamp.to_string ~format x) ]
+
   let document _ = assert false
   let option f x = match x with None -> [] | Some x -> f x
 
@@ -322,7 +330,9 @@ module From_XML = struct
     | "-Infinity" -> -1. /. 0.
     | x -> float_of_string x
 
-  let timestamp x = Timestamp.from_date_time (string x)
+  let timestamp ?(format = `Date_time) x =
+    Timestamp.from_string ~format (string x)
+
   let document _ = assert false
 
   let select_field name x =
@@ -394,7 +404,9 @@ module To_Graph = struct
          else "Infinity");
     ]
 
-  let timestamp x = [ `Data (Timestamp.to_date_time x) ]
+  let timestamp ?(format = `Date_time) x =
+    [ `Data (Timestamp.to_string ~format x) ]
+
   let document _ = assert false
   let option f x = match x with None -> [] | Some x -> f x
 
