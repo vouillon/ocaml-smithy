@@ -2153,19 +2153,22 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
             @ if has_optionals then [ (Nolabel, [%expr ()]) ] else [])]
       in
       let request_headers =
-        match request.body with
-        | Some b ->
-            ("Content-Length", string_of_int (String.length b))
-            :: request.headers
-        | None -> request.headers
+        List.map
+          (fun (k, v) -> (String.lowercase_ascii k, v))
+          (match request.body with
+          | Some b ->
+              ("Content-Length", string_of_int (String.length b))
+              :: request.headers
+          | None -> request.headers)
       in
       ignore request_headers;
       [%e
         [%expr
           let path = [%e B.pexp_constant (const_string test.uri)] in
-          let success = Uri.path request.uri = path in
+          let success = Uri.path request.uri = Uri.path (Uri.of_string path) in
           if not success then
-            Format.eprintf "path: <%s> <%s>@." (Uri.path request.uri) path;
+            Format.eprintf "path: <%s> <%s>@." (Uri.path request.uri)
+              (Uri.path (Uri.of_string path));
           success]
         |> add_test test.resolved_host (fun host ->
                [%expr
@@ -2202,7 +2205,11 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                let params =
                  List.fold_right
                    (fun h rem ->
-                     [%expr [%e B.pexp_constant (const_string h)] :: [%e rem]])
+                     [%expr
+                       [%e
+                         B.pexp_constant
+                           (const_string (String.lowercase_ascii h))]
+                       :: [%e rem]])
                    params [%expr []]
                in
                [%expr
@@ -2257,7 +2264,11 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                let headers =
                  List.fold_right
                    (fun h rem ->
-                     [%expr [%e B.pexp_constant (const_string h)] :: [%e rem]])
+                     [%expr
+                       [%e
+                         B.pexp_constant
+                           (const_string (String.lowercase_ascii h))]
+                       :: [%e rem]])
                    headers [%expr []]
                in
                [%expr
@@ -2281,7 +2292,11 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                let headers =
                  List.fold_right
                    (fun h rem ->
-                     [%expr [%e B.pexp_constant (const_string h)] :: [%e rem]])
+                     [%expr
+                       [%e
+                         B.pexp_constant
+                           (const_string (String.lowercase_ascii h))]
+                       :: [%e rem]])
                    headers [%expr []]
                in
                [%expr
@@ -2293,6 +2308,7 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                  in
                  if fail then (
                    Format.eprintf "Missing required header@.";
+                   List.iter (fun k -> Format.eprintf "%s@." k) headers;
                    List.iter
                      (fun (k, v) -> Format.eprintf "%s:%s@." k v)
                      request_headers;
@@ -2315,7 +2331,9 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
                  List.fold_right
                    (fun (k, v) rem ->
                      [%expr
-                       ( [%e B.pexp_constant (const_string k)],
+                       ( [%e
+                           B.pexp_constant
+                             (const_string (String.lowercase_ascii k))],
                          [%e B.pexp_constant (const_string v)] )
                        :: [%e rem]])
                    headers [%expr []]
@@ -2337,17 +2355,18 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
         |> add_test test.body (fun body ->
                match test.body_media_type with
                | Some "application/json" ->
-                   let body =
-                     B.pexp_constant
-                       (const_string
-                          (Yojson.Safe.to_string (Yojson.Safe.from_string body)))
-                   in
+                   let body = B.pexp_constant (const_string body) in
                    [%expr
                      let body = [%e body] in
                      let req_body = Option.value ~default:"" request.body in
-                     if req_body <> body then
+                     let success =
+                       Tests.json_eq
+                         (Yojson.Safe.from_string req_body)
+                         (Yojson.Safe.from_string body)
+                     in
+                     if not success then
                        Format.eprintf "<%s> <%s>@." req_body body;
-                     req_body = body]
+                     success]
                | None | Some ("application/octet-stream" | "image/jpg") ->
                    let body = B.pexp_constant (const_string body) in
                    [%expr
@@ -2365,7 +2384,9 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
     | None -> t
     | Some doc -> { t with pexp_attributes = [ text_attr doc ] }
   in
-  [%stri let%test [%p B.ppat_constant (const_string test.id)] = [%e t]]
+  [%stri
+    let%test [%p B.ppat_constant (const_string ("Request: " ^ test.id))] =
+      [%e t]]
 
 let compile_http_response_tests ~shapes ~rename ~output op_name
     (test : http_response_test) =
@@ -2423,7 +2444,9 @@ let compile_http_response_tests ~shapes ~rename ~output op_name
     | None -> t
     | Some doc -> { t with pexp_attributes = [ text_attr doc ] }
   in
-  [%stri let%test [%p B.ppat_constant (const_string test.id)] = [%e t]]
+  [%stri
+    let%test [%p B.ppat_constant (const_string ("Response: " ^ test.id))] =
+      [%e t]]
 
 let timestamp_format ~shapes ~traits ~typ ~default_format ~default =
   let format =
@@ -2439,13 +2462,22 @@ let timestamp_format ~shapes ~traits ~typ ~default_format ~default =
   in
   if format = default then None else Some (capitalized_identifier format)
 
-let convert_to_string ~shapes ~rename ~fields ?(default_format = "date-time") nm
-    expr =
-  let _, typ, traits = List.find (fun (nm', _, _) -> nm' = nm) fields in
+let media_type ~shapes typ =
+  match IdMap.find_opt typ shapes with
+  | None -> None
+  | Some { traits; _ } ->
+      Option.map Yojson.Safe.Util.to_string
+        (List.assoc_opt "smithy.api#mediaType" traits)
+
+let rec convert_to_string ~shapes ~rename ~fields
+    ?(default_format = "date-time") typ traits expr =
   match type_of_shape shapes typ with
-  | String -> expr
+  | String ->
+      if media_type ~shapes typ <> None then
+        [%expr Base64.encode_string [%e expr]]
+      else expr
   | Boolean -> [%expr Converters.To_String.boolean [%e expr]]
-  | Integer | Short -> [%expr Converters.To_String.integer [%e expr]]
+  | Integer | IntEnum | Short -> [%expr Converters.To_String.integer [%e expr]]
   | Long -> [%expr Converters.To_String.long [%e expr]]
   | Byte -> [%expr Converters.To_String.byte [%e expr]]
   | Float | Double -> [%expr Converters.To_String.float [%e expr]]
@@ -2464,11 +2496,26 @@ let convert_to_string ~shapes ~rename ~fields ?(default_format = "date-time") nm
       [%expr
         Yojson.Safe.Util.to_string
           (To_JSON.([%e ident (type_name ~rename typ)]) [%e expr])]
+  | List (typ, traits) ->
+      [%expr
+        String.concat ", "
+          (List.map
+             (fun e ->
+               [%e
+                 convert_to_string ~shapes ~rename ~fields ~default_format typ
+                   traits [%expr e]])
+             [%e expr])]
   | _ ->
       Format.eprintf "ZZZ %s@." typ.identifier;
+      (assert false : unit);
       [%expr
         ignore [%e expr];
         ""]
+
+let convert_to_string ~shapes ~rename ~fields ?(default_format = "date-time") nm
+    expr =
+  let _, typ, traits = List.find (fun (nm', _, _) -> nm' = nm) fields in
+  convert_to_string ~shapes ~rename ~fields ~default_format typ traits expr
 
 let compile_pattern ~shapes ~rename ~fields s =
   compile_string s @@ fun label property greedy ->
@@ -2653,12 +2700,7 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
           let value = ident (field_name nm ^ "'") in
           let convert, headers' =
             let content_type ~default =
-              Option.value ~default
-                (match IdMap.find_opt typ shapes with
-                | None -> None
-                | Some { traits; _ } ->
-                    Option.map Yojson.Safe.Util.to_string
-                      (List.assoc_opt "smithy.api#mediaType" traits))
+              Option.value ~default (media_type ~shapes typ)
             in
             match type_of_shape shapes typ with
             | Blob ->
