@@ -215,6 +215,7 @@ let create_rest_json_operation ~method_ ~builder ~parser ~errors =
             (*ZZZ*)
             let uri = Uri.of_string uri in
             assert (Uri.host endpoint <> None);
+            let headers = List.filter (fun (_, v) -> v <> "") headers in
             k
               {
                 uri =

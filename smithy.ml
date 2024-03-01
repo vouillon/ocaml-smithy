@@ -2667,16 +2667,30 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
   let headers', fields' =
     List.partition
       (fun (_, _, traits) ->
-        List.mem_assoc "smithy.api#httpHeaderPrefix" traits)
+        List.mem_assoc "smithy.api#httpPrefixHeaders" traits)
       fields'
   in
   let headers =
     (*ZZZ*)
     List.fold_left
-      (fun rem (nm, _, _) ->
+      (fun rem ((nm, typ, traits) as field) ->
+        let prefix =
+          Yojson.Safe.Util.to_string
+            (List.assoc "smithy.api#httpPrefixHeaders" traits)
+        in
+        Format.eprintf "HEADER %s/%s@." typ.namespace typ.identifier;
+        let optional = optional_member field in
         [%expr
-          ignore [%e ident (field_name nm ^ "'")];
-          [%e rem]])
+          Converters.StringMap.fold
+            (fun k v rem ->
+              ([%e B.pexp_constant (const_string prefix)] ^ k, v) :: rem)
+            [%e
+              if optional then
+                [%expr
+                  Option.value ~default:Converters.StringMap.empty
+                    [%e ident (field_name nm ^ "'")]]
+              else ident (field_name nm ^ "'")]
+            [%e rem]])
       headers headers'
   in
   let fields' =
