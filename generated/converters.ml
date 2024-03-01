@@ -15,7 +15,10 @@ module Timestamp = struct
     t
 
   let to_epoch_seconds t = Ptime.to_float_s t
-  let from_epoch_seconds t = Option.get (Ptime.of_float_s t)
+
+  let from_epoch_seconds t =
+    Ptime.truncate ~frac_s:3 (Option.get (Ptime.of_float_s t))
+
   let to_http_date = Http_date.encode
   let from_http_date = Http_date.decode
 
