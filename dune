@@ -1,5 +1,5 @@
 (executable (name smithy)
-  (libraries yojson re markup ppxlib)
+  (libraries yojson re markup ppxlib uri)
   (preprocess (pps ppxlib.metaquot)))
 
 (env

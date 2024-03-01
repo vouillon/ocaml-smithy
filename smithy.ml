@@ -2229,25 +2229,49 @@ let compile_http_request_tests ~shapes ~rename ~input has_optionals op_name
         |> add_test test.query_params (fun params ->
                let params =
                  List.fold_right
-                   (fun v rem ->
-                     [%expr [%e B.pexp_constant (const_string v)] :: [%e rem]])
+                   (fun p rem ->
+                     match String.index p '=' with
+                     | i ->
+                         let k = String.sub p 0 i in
+                         let v =
+                           String.sub p (i + 1) (String.length p - i - 1)
+                         in
+                         let l =
+                           try
+                             let l = StringMap.find k rem in
+                             assert (l <> []);
+                             l
+                           with Not_found -> []
+                         in
+                         StringMap.add k (v :: l) rem
+                     | exception Not_found ->
+                         assert (not (StringMap.mem p rem));
+                         StringMap.add p [] rem)
+                   params StringMap.empty
+               in
+               let params =
+                 StringMap.fold
+                   (fun k v rem ->
+                     [%expr
+                       ( [%e B.pexp_constant (const_string k)],
+                         [%e
+                           List.fold_right
+                             (fun x r ->
+                               [%expr
+                                 [%e
+                                   B.pexp_constant
+                                     (const_string (Uri.pct_decode x))]
+                                 :: [%e r]])
+                             v [%expr []]] )
+                       :: [%e rem]])
                    params [%expr []]
                in
                [%expr
                  let params = [%e params] in
                  let fail =
                    List.exists
-                     (fun p ->
-                       match String.index p '=' with
-                       | i ->
-                           let k = String.sub p 0 i in
-                           let v =
-                             String.sub p (i + 1) (String.length p - i - 1)
-                           in
-                           List.assoc_opt k (Uri.query request.uri)
-                           <> Some [ Uri.pct_decode v ]
-                       | exception Not_found ->
-                           List.assoc_opt p (Uri.query request.uri) <> Some [])
+                     (fun (k, v) ->
+                       List.assoc_opt k (Uri.query request.uri) <> Some v)
                      params
                  in
                  if fail then (
@@ -2496,14 +2520,23 @@ let rec convert_to_string ~shapes ~rename ~fields
       [%expr
         Yojson.Safe.Util.to_string
           (To_JSON.([%e ident (type_name ~rename typ)]) [%e expr])]
-  | List (typ, traits) ->
+  | List (typ', traits') ->
+      let convert =
+        convert_to_string ~shapes ~rename ~fields ~default_format typ' traits'
+          [%expr e]
+      in
+      let need_quotes =
+        (*ZZZ Be careful when decoding!*)
+        match type_of_shape shapes typ' with Timestamp -> false | _ -> true
+      in
       [%expr
         String.concat ", "
           (List.map
              (fun e ->
                [%e
-                 convert_to_string ~shapes ~rename ~fields ~default_format typ
-                   traits [%expr e]])
+                 if need_quotes then
+                   [%expr Converters.To_String.quote [%e convert]]
+                 else convert])
              [%e expr])]
   | _ ->
       Format.eprintf "ZZZ %s@." typ.identifier;
@@ -2512,16 +2545,12 @@ let rec convert_to_string ~shapes ~rename ~fields
         ignore [%e expr];
         ""]
 
-let convert_to_string ~shapes ~rename ~fields ?(default_format = "date-time") nm
-    expr =
-  let _, typ, traits = List.find (fun (nm', _, _) -> nm' = nm) fields in
-  convert_to_string ~shapes ~rename ~fields ~default_format typ traits expr
-
 let compile_pattern ~shapes ~rename ~fields s =
   compile_string s @@ fun label property greedy ->
   assert (property = None);
   let s =
-    convert_to_string ~shapes ~rename ~fields label
+    let _, typ, traits = List.find (fun (nm', _, _) -> nm' = label) fields in
+    convert_to_string ~shapes ~rename ~fields typ traits
       (ident (field_name label ^ "'"))
   in
   if greedy then
@@ -2579,31 +2608,81 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
       | { typ = Structure l; _ } -> l
       | _ -> assert false
   in
-  let params, fields' =
+  let params', fields' =
     List.partition
-      (fun (_, _, traits) -> List.mem_assoc "smithy.api#httpQuery" traits)
+      (fun (_, _, traits) -> List.mem_assoc "smithy.api#httpQueryParams" traits)
       fields
   in
   let params =
     List.fold_left
-      (fun rem ((nm, _, traits) as field) ->
+      (fun rem ((nm, typ, _) as field) ->
         let optional = optional_member field in
+        match type_of_shape shapes typ with
+        | Map (_, (typ', _)) ->
+            [%expr
+              Converters.StringMap.fold
+                (fun k v rem ->
+                  ( k,
+                    [%e
+                      match type_of_shape shapes typ' with
+                      | String -> [%expr [ v ]]
+                      | List _ -> [%expr v]
+                      | _ -> assert false] )
+                  :: rem)
+                [%e
+                  if optional then
+                    [%expr
+                      Option.value ~default:Converters.StringMap.empty
+                        [%e ident (field_name nm ^ "'")]]
+                  else ident (field_name nm ^ "'")]
+                [%e rem]]
+        | _ -> assert false)
+      [%expr []] params'
+  in
+  let has_query_params = params' <> [] in
+  let params', fields' =
+    List.partition
+      (fun (_, _, traits) -> List.mem_assoc "smithy.api#httpQuery" traits)
+      fields'
+  in
+  let params =
+    List.fold_left
+      (fun rem ((nm, typ, traits) as field) ->
+        let optional = optional_member field in
+        let name =
+          B.pexp_constant
+            (const_string
+               (Yojson.Safe.Util.to_string
+                  (List.assoc "smithy.api#httpQuery" traits)))
+        in
         [%expr
           let params = [%e rem] in
           [%e
             let add_param =
               [%expr
-                ( [%e
-                    B.pexp_constant
-                      (const_string
-                         (Yojson.Safe.Util.to_string
-                            (List.assoc "smithy.api#httpQuery" traits)))],
-                  [
-                    [%e
-                      convert_to_string ~shapes ~rename ~fields nm
-                        (ident (field_name nm ^ "'"))];
-                  ] )
-                :: params]
+                ( [%e name],
+                  [%e
+                    match type_of_shape shapes typ with
+                    | List (typ', traits') ->
+                        [%expr
+                          List.map
+                            (fun x ->
+                              [%e
+                                convert_to_string ~shapes ~rename ~fields typ'
+                                  traits' [%expr x]])
+                            [%e ident (field_name nm ^ "'")]]
+                    | _ ->
+                        [%expr
+                          [
+                            [%e
+                              convert_to_string ~shapes ~rename ~fields typ
+                                traits
+                                (ident (field_name nm ^ "'"))];
+                          ]]] )
+                :: [%e
+                     if has_query_params then
+                       [%expr List.remove_assoc [%e name] params]
+                     else [%expr params]]]
             in
             if optional then
               [%expr
@@ -2613,20 +2692,6 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
                     [%e add_param]
                 | None -> params]
             else add_param]])
-      [%expr []] params
-  in
-  let params', fields' =
-    List.partition
-      (fun (_, _, traits) -> List.mem_assoc "smithy.api#httpQueryParams" traits)
-      fields'
-  in
-  let params =
-    (*ZZZ*)
-    List.fold_left
-      (fun rem (nm, _, _) ->
-        [%expr
-          ignore [%e ident (field_name nm ^ "'")];
-          [%e rem]])
       params params'
   in
   let headers, fields' =
@@ -2636,7 +2701,7 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
   in
   let headers =
     List.fold_left
-      (fun rem ((nm, _, traits) as field) ->
+      (fun rem ((nm, typ, traits) as field) ->
         let optional = optional_member field in
         [%expr
           let headers = [%e rem] in
@@ -2650,7 +2715,7 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
                             (List.assoc "smithy.api#httpHeader" traits)))],
                   [%e
                     convert_to_string ~shapes ~rename ~fields
-                      ~default_format:"http-date" nm
+                      ~default_format:"http-date" typ traits
                       (ident (field_name nm ^ "'"))] )
                 :: headers]
             in
@@ -2671,14 +2736,12 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
       fields'
   in
   let headers =
-    (*ZZZ*)
     List.fold_left
-      (fun rem ((nm, typ, traits) as field) ->
+      (fun rem ((nm, _, traits) as field) ->
         let prefix =
           Yojson.Safe.Util.to_string
             (List.assoc "smithy.api#httpPrefixHeaders" traits)
         in
-        Format.eprintf "HEADER %s/%s@." typ.namespace typ.identifier;
         let optional = optional_member field in
         [%expr
           Converters.StringMap.fold

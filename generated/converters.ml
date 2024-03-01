@@ -49,6 +49,13 @@ module To_String = struct
     else "Infinity"
 
   let timestamp ?(format = `Date_time) t = Timestamp.to_string ~format t
+  let quote_regexp = Re.(compile (char '"'))
+
+  let quote s =
+    if String.contains s '"' then
+      "\"" ^ Re.replace_string quote_regexp ~by:"\\\"" s ^ "\""
+    else if String.contains s ',' then "\"" ^ s ^ "\""
+    else s
 end
 
 module To_JSON = struct
