@@ -358,7 +358,7 @@ let parse f =
 
 let rec resolve_mixin shapes id =
   let sh = IdMap.find id shapes in
-  if List.is_empty sh.mixins then shapes
+  if sh.mixins = [] then shapes
   else
     let shapes = List.fold_left resolve_mixin shapes sh.mixins in
     let l =
@@ -2861,7 +2861,9 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
       (fun (_, _, traits) -> not (List.mem_assoc "smithy.api#httpLabel" traits))
       fields'
   in
+  (*
   Format.eprintf "ZZZZZ %d@." (List.length fields');
+*)
   (*ZZZ*)
   let builder =
     let add_content_type typ headers =
@@ -3650,24 +3652,20 @@ let compile dir f =
 
 let () =
   let _f { namespace = _; identifier = _ } = () in
-  (*
-  let dir = "/home/jerome/sources/aws-sdk-rust/aws-models" in
-  *)
-  let dir = "." in
-  if true then
-    let files = Array.to_list (Sys.readdir dir) in
-    let files =
-      List.filter
-        (fun f ->
-          f <> "sdk-default-configuration.json"
-          && f <> "sdk-endpoints.json" && f <> "sdk-partitions.json"
-          && Filename.check_suffix f ".json")
-        files
-    in
-    List.iter (fun f -> compile dir f) files
-  else
-    let f = "s3.json" in
-    compile dir f
+  let dirs = [ "aws-models"; "aws-tests" ] in
+  List.iter
+    (fun dir ->
+      let files = Array.to_list (Sys.readdir dir) in
+      let files =
+        List.filter
+          (fun f ->
+            f <> "sdk-default-configuration.json"
+            && f <> "sdk-endpoints.json" && f <> "sdk-partitions.json"
+            && Filename.check_suffix f ".json")
+          files
+      in
+      List.iter (fun f -> compile dir f) files)
+    dirs
 
 (*
 Aws_lwt.perform S3.list_buckets
