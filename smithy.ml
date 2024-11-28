@@ -1,6 +1,4 @@
 (*
-Mixins
-
 TODO
 - generate operations for all protocols
 - sign and perform requests
@@ -35,7 +33,8 @@ To_XML ==> xmlNamespace / xmlAttribute
 
 type 'a error = {code : int; name : string; body: string; value : 'a }
 
-
+enum are open (can send or receive arbitrary values)
+===> add an 'Other of string'
 
 context :
 ==> Lwt/async
@@ -2867,8 +2866,11 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
   let builder =
     let add_content_type typ headers =
       [%expr
-        ("Content-Type", [%e B.pexp_constant (const_string typ)])
-        :: [%e headers]]
+        let headers = [%e headers] in
+        (*ZZZ Should be case insensitive... *)
+        if List.mem_assoc "Content-Type" headers then headers
+        else
+          ("Content-Type", [%e B.pexp_constant (const_string typ)]) :: headers]
     in
     let body, headers =
       match fields' with
@@ -2876,64 +2878,64 @@ let compile_rest_json_operation ~service_info ~shapes ~rename nm
       | [ ((nm, typ, traits) as field) ]
         when List.mem_assoc "smithy.api#httpPayload" traits ->
           let value = ident (field_name nm ^ "'") in
-          let convert, headers' =
+          let convert, content_type =
             let content_type ~default =
               Option.value ~default (media_type ~shapes typ)
             in
+            let optional = optional_member field in
             match type_of_shape shapes typ with
             | Blob ->
-                ( [%expr Some [%e value]],
-                  add_content_type
-                    (content_type ~default:"application/octet-stream")
-                    [%expr headers] )
+                ( (if optional then [%expr Option.value ~default:"" [%e value]]
+                   else value),
+                  content_type ~default:"application/octet-stream" )
             | String ->
-                ( [%expr Some [%e value]],
-                  add_content_type
-                    (content_type ~default:"text/plain")
-                    [%expr headers] )
+                ( (if optional then [%expr Option.value ~default:"" [%e value]]
+                   else value),
+                  content_type ~default:"text/plain" )
             | Enum _ ->
                 ( [%expr
-                    Some
-                      (Yojson.Safe.Util.to_string
-                         (To_JSON.([%e ident (type_name ~rename typ)])
-                            [%e value]))],
-                  add_content_type "text/plain" [%expr headers] )
+                    match [%e value] with
+                    | None -> ""
+                    | Some v ->
+                        Yojson.Safe.Util.to_string
+                          (To_JSON.([%e ident (type_name ~rename typ)]) v)],
+                  "text/plain" )
             | Document ->
-                ( [%expr Some (Yojson.Safe.to_string [%e value])],
-                  add_content_type "application/json" [%expr headers] )
+                ( [%expr
+                    Yojson.Safe.to_string
+                      [%e
+                        if optional then
+                          [%expr Option.value ~default:(`Assoc []) [%e value]]
+                        else value]],
+                  "application/json" )
             | Union _ | Structure _ ->
                 ( [%expr
-                    Some
-                      (Yojson.Safe.to_string
-                         (let open To_JSON in
-                          [%e
-                            let path =
-                              Longident.(Ldot (Lident "Converters", "To_JSON"))
-                            in
-                            converter ~rename ~path ~sparse:false typ]
-                            [%e value]))],
-                  add_content_type "application/json" [%expr headers] )
+                    Yojson.Safe.to_string
+                      (let open To_JSON in
+                       [%e
+                         if optional then
+                           [%expr
+                             match [%e value] with
+                             | None -> `Assoc []
+                             | Some v ->
+                                 [%e
+                                   let path =
+                                     Longident.(
+                                       Ldot (Lident "Converters", "To_JSON"))
+                                   in
+                                   converter ~rename ~path ~sparse:false typ]
+                                   v]
+                         else
+                           let path =
+                             Longident.(Ldot (Lident "Converters", "To_JSON"))
+                           in
+                           [%expr
+                             [%e converter ~rename ~path ~sparse:false typ]
+                               [%e value]]])],
+                  "application/json" )
             | _ -> assert false
           in
-          if optional_member field then
-            ( [%expr
-                match [%e value] with
-                | None -> None
-                | Some [%p B.ppat_var (Location.mknoloc (field_name nm ^ "'"))]
-                  ->
-                    [%e convert]],
-              [%expr
-                let headers = [%e headers] in
-                match [%e value] with
-                | None -> headers
-                | Some [%p B.ppat_var (Location.mknoloc (field_name nm ^ "'"))]
-                  ->
-                    [%e headers']] )
-          else
-            ( convert,
-              [%expr
-                let headers = [%e headers] in
-                [%e headers']] )
+          ([%expr Some [%e convert]], add_content_type content_type headers)
       | _ ->
           ( [%expr
               Some
